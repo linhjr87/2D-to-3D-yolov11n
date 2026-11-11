@@ -1,0 +1,16 @@
+# Pinned training config; optimizer "auto" is forbidden (see docs/ultralytics_notes.md).
+model: yolov8n.pt
+imgsz: 1024
+epochs: 300
+patience: 50
+batch: 32
+optimizer: SGD
+lr0: 0.01
+hsv_h: 0
+hsv_s: 0
+hsv_v: 0
+fliplr: 0.5
+flipud: 0.5
+degrees: 0
+deterministic: true
+workers: 8
