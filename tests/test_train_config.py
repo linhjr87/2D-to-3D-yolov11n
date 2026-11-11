@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 import types
 
 import pytest
@@ -6,7 +9,7 @@ import yaml
 
 from conftest import CONFIGS, REPO
 from fpyolo import train
-from fpyolo.train import env_record, main, train_kwargs
+from fpyolo.train import apply_device_env, env_record, main, train_kwargs
 
 
 def _load(name):
@@ -81,12 +84,15 @@ def test_env_record_manifest_hash(tmp_path):
 def test_env_record_gpu_branch_without_touching_a_gpu(monkeypatch):
     fake = types.SimpleNamespace(
         get_device_name=lambda i: f"Fake GPU {i}",
+        get_device_properties=lambda i: types.SimpleNamespace(
+            pci_domain_id=0, pci_bus_id=0x3B, pci_device_id=0
+        ),
         mem_get_info=lambda i: (10 * 2**30, 24 * 2**30),
     )
     monkeypatch.setattr(train.torch, "cuda", fake)
     rec = env_record("3")
     assert rec["device"] == "3"
-    assert rec["gpu"] == {"index": 3, "name": "Fake GPU 3", "free_mib": 10240, "total_mib": 24576}
+    assert rec["gpu"] == {"index": 3, "name": "Fake GPU 3", "pci_bus_id": "00000000:3B:00.0", "free_mib": 10240, "total_mib": 24576}
     with pytest.raises(ValueError):
         env_record("0,1")
 
@@ -103,3 +109,24 @@ def test_main_refuses_existing_run_dir(tmp_path):
     with pytest.raises(SystemExit):
         main(["--config", str(cfg), "--data", "d.yaml", "--seed", "0",
               "--project", str(tmp_path), "--name", "run", "--device", "cpu"])
+
+
+def test_import_forces_pci_bus_id_order():
+    env = dict(os.environ, CUDA_DEVICE_ORDER="FASTEST_FIRST")
+    out = subprocess.run(
+        [sys.executable, "-c", "import fpyolo, os; print(os.environ['CUDA_DEVICE_ORDER'])"],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    assert out.stdout.strip() == "PCI_BUS_ID"
+
+
+def test_cpu_device_hides_gpus(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    apply_device_env("cpu")
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == ""
+
+
+def test_gpu_device_leaves_visibility_alone(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    apply_device_env("1")
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1"

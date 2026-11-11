@@ -64,9 +64,14 @@ line numbers refer to that version. Re-check them after any upgrade.
   freeze, val, plots, channels_last, ...` (lines 1059-1075) can be overridden; anything else is ignored with a warning
   (line 1083). The wrapper has no resume mode: it refuses an existing `<project>/<name>` directory, and
   resuming goes through Ultralytics directly (pass `device=<idx>` explicitly). `env.json` of the original launch is kept.
-- `select_device` (`utils/torch_utils.py`, lines 325-372): `device=cpu` goes straight to `torch.device("cpu")`; it
-  does not hide the GPUs, so the CPU smoke runs were additionally launched with `CUDA_VISIBLE_DEVICES=""`.
-  For a numeric device it validates `int(x) < torch.cuda.device_count()` (line 328) and translates ids under an
-  external `CUDA_VISIBLE_DEVICES` (lines 195-232). Unless `CUDA_DEVICE_ORDER=PCI_BUS_ID` is set, torch may order GPUs
-  differently from `nvidia-smi`, so a torch index can differ from the `nvidia-smi` index; `env.json` records the name
-  and free/total memory of the device that torch actually opened, to make a mismatch visible.
+
+## GPU indices
+
+`select_device` (`utils/torch_utils.py`, def at line 244; body 325-372): `device=cpu` goes straight to
+`torch.device("cpu")` and does not hide the GPUs. A numeric device is validated with `int(x) < torch.cuda.device_count()`
+(line 328) and used as torch's `cuda:<n>`; the function never sets `CUDA_VISIBLE_DEVICES` (it only translates ids when
+the user already set it externally, in `parse_device`, def at line 176, lines 195-240). Torch's default `CUDA_DEVICE_ORDER=FASTEST_FIRST` need not match
+`nvidia-smi` numbering, but the user approves GPUs by their `nvidia-smi` index. Therefore `fpyolo/__init__.py` forces
+`CUDA_DEVICE_ORDER=PCI_BUS_ID` (assignment, so an external value cannot break it), the wrapper sets
+`CUDA_VISIBLE_DEVICES=""` for `--device cpu`, and `env.json` records the opened GPU's name, memory and PCI bus id
+(compare with `nvidia-smi --query-gpu=index,pci.bus_id --format=csv`).

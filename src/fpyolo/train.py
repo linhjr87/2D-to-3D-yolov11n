@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -61,12 +62,24 @@ def _gpu_info(device: str) -> dict:
     except ValueError:
         raise ValueError(f"device must be 'cpu' or a single GPU index, got {device!r}") from None
     free, total = torch.cuda.mem_get_info(idx)
+    props = torch.cuda.get_device_properties(idx)
     return {
         "index": idx,
         "name": torch.cuda.get_device_name(idx),
+        # same format as `nvidia-smi --query-gpu=pci.bus_id`, e.g. 00000000:3B:00.0
+        "pci_bus_id": f"{props.pci_domain_id:08X}:{props.pci_bus_id:02X}:{props.pci_device_id:02X}.0",
         "free_mib": free // 2**20,
         "total_mib": total // 2**20,
     }
+
+
+def apply_device_env(device: str) -> None:
+    """Hide every GPU when the run is on the CPU (Ultralytics' select_device does not).
+
+    Must run before the first CUDA call.
+    """
+    if device == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 
 def env_record(device: str, data_yaml: Path | None = None) -> dict:
@@ -115,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
     if run_dir.exists():
         # Ultralytics would silently write to <name>2; env.json must sit next to the weights.
         ap.error(f"{run_dir} already exists; pick a new --name (to continue a run use YOLO(last.pt).train(resume=True))")
+    apply_device_env(args.device)
     record = env_record(args.device, args.data)
     run_dir.mkdir(parents=True)
     (run_dir / "env.json").write_text(json.dumps(record, indent=2) + "\n")
