@@ -1,35 +1,36 @@
 version: v0
+# Names read from the dataset authors' coco_vis labels; evidence in reports/class_names.md.
 classes:
-  - {schema_id: 1, semantic_id: 3, name: sid_03, group: door, model: D}
-  - {schema_id: 2, semantic_id: 4, name: sid_04, group: door, model: D}
-  - {schema_id: 3, semantic_id: 5, name: sid_05, group: door, model: D}
-  - {schema_id: 4, semantic_id: 6, name: sid_06, group: door, model: D}
-  - {schema_id: 5, semantic_id: 7, name: sid_07, group: door, model: D}
-  - {schema_id: 6, semantic_id: 8, name: sid_08, group: door, model: D}
-  - {schema_id: 7, semantic_id: 9, name: sid_09, group: window, model: D}
-  - {schema_id: 8, semantic_id: 10, name: sid_10, group: window, model: D}
-  - {schema_id: 9, semantic_id: 11, name: sid_11, group: window, model: D}
-  - {schema_id: 10, semantic_id: 12, name: sid_12, group: window, model: D}
-  - {schema_id: 11, semantic_id: 13, name: sid_13, group: furniture, model: D}
-  - {schema_id: 12, semantic_id: 14, name: sid_14, group: furniture, model: D}
-  - {schema_id: 13, semantic_id: 15, name: sid_15, group: furniture, model: D}
-  - {schema_id: 14, semantic_id: 16, name: sid_16, group: furniture, model: D}
-  - {schema_id: 15, semantic_id: 17, name: sid_17, group: furniture, model: D}
-  - {schema_id: 16, semantic_id: 18, name: sid_18, group: furniture, model: D}
-  - {schema_id: 17, semantic_id: 19, name: sid_19, group: furniture, model: D}
-  - {schema_id: 18, semantic_id: 20, name: sid_20, group: sanitary-kitchen, model: D}
+  - {schema_id: 1, semantic_id: 3, name: single_door, group: door, model: D}
+  - {schema_id: 2, semantic_id: 4, name: double_door, group: door, model: D}
+  - {schema_id: 3, semantic_id: 5, name: sliding_door, group: door, model: D}
+  - {schema_id: 4, semantic_id: 6, name: folding_door, group: door, model: D}
+  - {schema_id: 5, semantic_id: 7, name: revolving_door, group: door, model: D}
+  - {schema_id: 6, semantic_id: 8, name: rolling_door, group: door, model: D}
+  - {schema_id: 7, semantic_id: 9, name: window, group: window, model: D}
+  - {schema_id: 8, semantic_id: 10, name: bay_window, group: window, model: D}
+  - {schema_id: 9, semantic_id: 11, name: blind_window, group: window, model: D}
+  - {schema_id: 10, semantic_id: 12, name: opening_symbol, group: window, model: D}
+  - {schema_id: 11, semantic_id: 13, name: sofa, group: furniture, model: D}
+  - {schema_id: 12, semantic_id: 14, name: bed, group: furniture, model: D}
+  - {schema_id: 13, semantic_id: 15, name: chair, group: furniture, model: D}
+  - {schema_id: 14, semantic_id: 16, name: table, group: furniture, model: D}
+  - {schema_id: 15, semantic_id: 17, name: tv_cabinet, group: furniture, model: D}
+  - {schema_id: 16, semantic_id: 18, name: wardrobe, group: furniture, model: D}
+  - {schema_id: 17, semantic_id: 19, name: cabinet, group: furniture, model: D}
+  - {schema_id: 18, semantic_id: 20, name: refrigerator, group: sanitary-kitchen, model: D}
   - {schema_id: 19, semantic_id: 21, name: airconditioner, group: appliance-hvac, model: D}
-  - {schema_id: 20, semantic_id: 22, name: sid_22, group: sanitary-kitchen, model: D}
-  - {schema_id: 21, semantic_id: 23, name: sid_23, group: sanitary-kitchen, model: D}
-  - {schema_id: 22, semantic_id: 24, name: sid_24, group: sanitary-kitchen, model: D}
-  - {schema_id: 23, semantic_id: 25, name: sid_25, group: sanitary-kitchen, model: D}
-  - {schema_id: 24, semantic_id: 26, name: sid_26, group: sanitary-kitchen, model: D}
-  - {schema_id: 25, semantic_id: 27, name: sid_27, group: sanitary-kitchen, model: D}
-  - {schema_id: 26, semantic_id: 28, name: sid_28, group: sanitary-kitchen, model: D}
-  - {schema_id: 27, semantic_id: 29, name: sid_29, group: sanitary-kitchen, model: D}
-  - {schema_id: 28, semantic_id: 30, name: sid_30, group: vertical-circulation, model: D}
-  - {schema_id: 29, semantic_id: 31, name: sid_31, group: vertical-circulation, model: D}
-  - {schema_id: 30, semantic_id: 32, name: sid_32, group: vertical-circulation, model: D}
+  - {schema_id: 20, semantic_id: 22, name: gas_stove, group: sanitary-kitchen, model: D}
+  - {schema_id: 21, semantic_id: 23, name: sink, group: sanitary-kitchen, model: D}
+  - {schema_id: 22, semantic_id: 24, name: bath, group: sanitary-kitchen, model: D}
+  - {schema_id: 23, semantic_id: 25, name: bath_tub, group: sanitary-kitchen, model: D}
+  - {schema_id: 24, semantic_id: 26, name: washing_machine, group: sanitary-kitchen, model: D}
+  - {schema_id: 25, semantic_id: 27, name: squat_toilet, group: sanitary-kitchen, model: D}
+  - {schema_id: 26, semantic_id: 28, name: urinal, group: sanitary-kitchen, model: D}
+  - {schema_id: 27, semantic_id: 29, name: toilet, group: sanitary-kitchen, model: D}
+  - {schema_id: 28, semantic_id: 30, name: stairs, group: vertical-circulation, model: D}
+  - {schema_id: 29, semantic_id: 31, name: elevator, group: vertical-circulation, model: D}
+  - {schema_id: 30, semantic_id: 32, name: escalator, group: vertical-circulation, model: D}
   - {schema_id: 31, semantic_id: 1, name: wall, group: wall, model: W}
   - {schema_id: 32, semantic_id: 2, name: curtain_wall, group: wall, model: W, enabled: false}
   - {schema_id: 33, semantic_id: 33, name: railing, group: wall, model: W, enabled: false}

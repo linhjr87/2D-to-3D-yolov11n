@@ -14,7 +14,8 @@ def test_v0_counts_and_indices():
     assert s.yolo_index("D")[3] == 0 and s.yolo_index("D")[32] == 29
     assert s.by_schema_id(19).name == "airconditioner" and s.by_schema_id(19).group == "appliance-hvac"
     assert s.by_schema_id(31).semantic_id == 1
-    assert s.yolo_names("D")[0] == "sid_03" and s.yolo_names("W") == {0: "wall"}
+    assert s.yolo_names("D")[0] == "single_door" and s.yolo_names("W") == {0: "wall"}
+    assert len(set(s.yolo_names("D").values())) == 30  # names confirmed in reports/class_names.md
 
 
 def _write(path, doc):

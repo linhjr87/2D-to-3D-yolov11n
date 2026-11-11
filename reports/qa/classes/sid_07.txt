@@ -1,0 +1,8 @@
+# sid 7: 7 objects in all tiles; 5 shown (seed 0)
+# common layers (objects per inkscape layer label, all tiles): AED_180233_Hotel_L1-L5_Plan$0$214 CURTAIN WALL (1), 家具-省院 (1), H-L1$0$XFINE-铝板 (1), H-L1$0$XFINE-钢 (1), H-L1$0$PUB_HATCH (1)
+# archive	stem	instance_id	box_px x0 y0 x1 y1	coco_vis_frame x0 y0 x1 y1
+train-00	0155-0004	52	798.5 567.8 831.2 782.8	255 240 1795 1780
+train-00	0364-0028	5	2.1 0.5 257.1 280.0	255 240 1795 1780
+test-00	0650-0105	1	131.0 510.7 394.0 645.7	255 240 1795 1780
+train-01	0090-0092	7	774.6 11.0 924.6 161.0	255 240 1795 1780
+train-00	0018-0029	1	0.0 795.6 234.0 1000.0	255 240 1795 1780

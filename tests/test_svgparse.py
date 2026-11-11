@@ -19,6 +19,26 @@ def test_rotated_ellipse_bbox(tmp_path):
     assert t.primitives[0].closed
 
 
+def test_rotated_ellipse_polyline_is_rotated(tmp_path):
+    # Real data (train-01/1099-0032, sid 23): reify cannot fold a rotation into an
+    # <ellipse>, so the residual transform must still be applied to the samples.
+    t = tile_with(tmp_path, '<ellipse cx="50" cy="50" rx="20" ry="10" transform="rotate(30 50 50)" semantic-id="9" instance-id="1"/>')
+    p = t.primitives[0]
+    d = p.polyline - 50
+    c, s = np.cos(np.radians(30)), np.sin(np.radians(30))
+    u, v = d[:, 0] * c + d[:, 1] * s, -d[:, 0] * s + d[:, 1] * c  # back to the ellipse frame
+    assert (u / 20) ** 2 + (v / 10) ** 2 == pytest.approx(1.0, abs=1e-6)
+    assert (*p.polyline.min(axis=0), *p.polyline.max(axis=0)) == pytest.approx(p.bbox, abs=1e-2)
+
+
+def test_scaled_circle_polyline_stays_dense(tmp_path):
+    t = tile_with(tmp_path, '<circle cx="10" cy="10" r="5" transform="scale(4,2)" semantic-id="9" instance-id="1"/>')
+    p = t.primitives[0]
+    assert p.bbox == pytest.approx((20, 10, 60, 30), abs=1e-3)
+    assert (*p.polyline.min(axis=0), *p.polyline.max(axis=0)) == pytest.approx(p.bbox, abs=1e-2)
+    assert np.hypot(*np.diff(p.polyline, axis=0).T).max() <= 0.05 + 1e-9
+
+
 def test_group_transform_applied(tmp_path):
     t = tile_with(tmp_path, '<g transform="translate(10,0)"><path d="M 0,0 L 5,5" semantic-id="3" instance-id="0"/></g>')
     assert t.primitives[0].bbox == pytest.approx((10, 0, 15, 5))

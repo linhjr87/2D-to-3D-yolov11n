@@ -91,7 +91,10 @@ def parse_tile(svg_path: Path, archive: str) -> Tile:
         if ids == "bad":
             skipped += 1
             continue
-        path = SvgPath(el)
+        # abs() applies the residual transform reify leaves on shapes it cannot
+        # rewrite (e.g. a rotated <ellipse>); iterating SvgPath(el) alone would
+        # yield untransformed segments.
+        path = abs(SvgPath(el))
         poly = _sample(path)
         bbox = el.bbox()
         if bbox is None or len(poly) == 0 or not all(math.isfinite(float(v)) for v in bbox):
