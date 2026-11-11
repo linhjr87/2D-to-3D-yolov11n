@@ -110,3 +110,47 @@ def test_cli_contact_sheet_on_spaced_path(spaced_tmp):
     assert len(list(out.glob("sid_*.png"))) == 30 and len(list(out.glob("sid_*.txt"))) == 30
     rows = [l for l in (out / "sid_03.txt").read_text(encoding="utf-8").splitlines() if not l.startswith("#")]
     assert rows == ["train-00\t0000-0000\t0\t400.0 500.0 600.0 600.0\t255 240 1795 1780"]
+
+
+def _built_minidata(root):
+    from fpyolo.build import main as build_main
+    from minidata import make_minidata, write_cfg
+
+    md = make_minidata(root)
+    out = root / "built é"
+    assert build_main(["--src", str(md.src), "--out", str(out), "--config", str(write_cfg(root / "cfg.yaml")),
+                       "--workers", "1"]) == 0
+    return md, out
+
+
+def test_overlays_one_image_per_sampled_tile_for_D_and_W(spaced_tmp):
+    _, out = _built_minidata(spaced_tmp)
+    for kind in ("D", "W"):
+        dst = spaced_tmp / f"overlays {kind}"
+        assert main(["overlays", "--dataset", str(out / kind), "--n", "4", "--seed", "0", "--out", str(dst)]) == 0
+        pngs = sorted(dst.glob("*.png"))
+        assert len(pngs) == 4
+        assert all(p.stem.split("_", 1)[0] in ("train", "val", "test") for p in pngs)
+    # a W overlay of a wall tile is not just the ink image: the wall body is painted
+    wall_tile = next((out / "W" / "labels").rglob("train-00_0015-0001.txt"))
+    split = wall_tile.parent.name
+    dst = spaced_tmp / "all W"
+    assert main(["overlays", "--dataset", str(out / "W"), "--n", "100", "--seed", "0", "--out", str(dst)]) == 0
+    with Image.open(dst / f"{split}_train-00_0015-0001.png") as im:
+        rgb = np.asarray(im.convert("RGB")).astype(int)
+    with Image.open(out / "W" / "images" / split / "train-00_0015-0001.png") as im:
+        ink = np.asarray(im.convert("RGB")).astype(int)
+    assert np.abs(rgb - ink)[305:315, 305:795].mean() > 20  # inside the 30..80 x 30..32 wall body
+
+
+def test_pair_sheet_one_image_per_candidate(spaced_tmp):
+    md, out = _built_minidata(spaced_tmp)
+    stats = spaced_tmp / "stats.json"
+    pairs = [{"a": "train-00_0004-0002", "b": "test-00_0013-0001", "group_a": "A/0004", "group_b": "B/0013",
+              "cosine": 0.91},
+             {"a": "train-00_0005-0001", "b": "train-01_0007-0001", "group_a": "A/0005", "group_b": "B/0007",
+              "cosine": 0.88}]
+    stats.write_text(json.dumps({"cross_space_candidates": pairs}), encoding="utf-8")
+    dst = spaced_tmp / "cross space"
+    assert main(["pair-sheet", "--stats", str(stats), "--src", str(md.src), "--out", str(dst)]) == 0
+    assert sorted(p.name for p in dst.glob("*.png")) == ["pair_00.png", "pair_01.png"]

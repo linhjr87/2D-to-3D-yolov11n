@@ -1,7 +1,10 @@
-"""Real-data QA: class contact sheets and the analytic-bbox vs. re-rasterization check.
+"""Real-data QA: class contact sheets, the analytic-bbox vs. re-rasterization check,
+label overlays of a built dataset and side-by-side sheets of cross-space candidate pairs.
 
     python -m fpyolo.qa contact-sheet --src <FloorPlanCAD> --out reports/qa/classes --per-class 12 --seed 0
     python -m fpyolo.qa bbox-raster --src <FloorPlanCAD> --n 500 --seed 0 --out reports/qa/bbox_raster.json
+    python -m fpyolo.qa overlays --dataset <out>/D --n 50 --seed 0 --out reports/qa/overlays_D
+    python -m fpyolo.qa pair-sheet --stats <out>/manifests/stats.json --src <FloorPlanCAD> --out reports/qa/cross_space
 
 Pixel convention: image coordinates are viewBox coordinates scaled to the
 true image size; pixel (i, j) is centered on integer coordinates (OpenCV
@@ -20,6 +23,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import yaml
 from PIL import Image
 
 from fpyolo.ink import load_ink
@@ -407,6 +411,95 @@ def cmd_bbox_raster(args) -> int:
     return 0 if report["passed"] else 1
 
 
+# ---------------------------------------------------------------- overlays ---
+
+
+_FILL_ALPHA = 0.45  # opacity of filled segmentation polygons
+_PAIR_CAPTION_H = 28
+
+
+def _class_color(cls: int) -> tuple[int, int, int]:
+    """Saturated RGB colour per class index (golden-angle hue steps keep neighbours apart)."""
+    hsv = np.uint8([[[int(cls * 137.5) % 180, 255, 210]]])
+    return tuple(int(v) for v in cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)[0, 0])
+
+
+def _save_palette_png(rgb: np.ndarray, path: Path) -> None:
+    """256-colour palette PNG: line drawings stay sharp and the files ~3x smaller."""
+    im = Image.fromarray(rgb).quantize(256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+    im.save(path, optimize=True)
+
+
+def overlay_labels(rgb: np.ndarray, label_text: str, names: dict[int, str]) -> np.ndarray:
+    """Draw YOLO label lines on an RGB image: `cls cx cy w h` lines as boxes captioned with the
+    class name, longer lines (`cls x1 y1 x2 y2 ...`) as translucent filled polygons with outlines."""
+    h, w = rgb.shape[:2]
+    fill = rgb.copy()
+    boxes, polys = [], []
+    for line in label_text.splitlines():
+        vals = line.split()
+        if not vals:
+            continue
+        cls, xy = int(vals[0]), np.array(vals[1:], dtype=np.float64)
+        color = _class_color(cls)
+        if len(xy) == 4:
+            cx, cy, bw, bh = xy * (w, h, w, h)
+            p0 = (int(round(cx - bw / 2)), int(round(cy - bh / 2)))
+            p1 = (int(round(cx + bw / 2)), int(round(cy + bh / 2)))
+            boxes.append((p0, p1, color, names.get(cls, str(cls))))
+        else:
+            pts = np.round(xy.reshape(-1, 2) * (w, h)).astype(np.int32)
+            cv2.fillPoly(fill, [pts], color)
+            polys.append((pts, color))
+    out = cv2.addWeighted(fill, _FILL_ALPHA, rgb, 1 - _FILL_ALPHA, 0) if polys else rgb.copy()
+    for pts, color in polys:
+        cv2.polylines(out, [pts], True, color, 1, cv2.LINE_8)
+    for p0, p1, color, name in boxes:
+        cv2.rectangle(out, p0, p1, color, 1)
+        cv2.putText(out, name, (p0[0], max(p0[1] - 3, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    return out
+
+
+def cmd_overlays(args) -> int:
+    ds, out = Path(args.dataset), Path(args.out)
+    names = yaml.safe_load((ds / "data.yaml").read_text(encoding="utf-8"))["names"]
+    images = sorted((ds / "images").glob("*/*.png"))
+    pick = np.random.default_rng(args.seed).choice(len(images), size=min(args.n, len(images)), replace=False)
+    out.mkdir(parents=True, exist_ok=True)
+    for i in sorted(pick):
+        img, split = images[i], images[i].parent.name
+        lbl = ds / "labels" / split / f"{img.stem}.txt"
+        with Image.open(img) as im:
+            rgb = np.asarray(im.convert("RGB"))
+        text = lbl.read_text(encoding="utf-8") if lbl.exists() else ""
+        _save_palette_png(overlay_labels(rgb, text, names), out / f"{split}_{img.stem}.png")
+    print(f"{len(pick)} overlays of {len(images)} images -> {out}")
+    return 0
+
+
+def cmd_pair_sheet(args) -> int:
+    """One image per cross-space candidate pair: the two ink tiles side by side, captioned."""
+    src, out = Path(args.src), Path(args.out)
+    pairs = json.loads(Path(args.stats).read_text(encoding="utf-8"))["cross_space_candidates"]
+    out.mkdir(parents=True, exist_ok=True)
+    side = args.size
+    for k, p in enumerate(pairs):
+        sheet = np.full((side + _PAIR_CAPTION_H, 2 * side + _GAP), 255, dtype=np.uint8)
+        for col, key in enumerate(("a", "b")):
+            archive, stem = p[key].rsplit("_", 1)
+            ink = load_ink(src / archive / f"{stem}.png")
+            cell = cv2.resize(ink, (side, round(side * ink.shape[0] / ink.shape[1])), interpolation=cv2.INTER_AREA)
+            x = col * (side + _GAP)
+            sheet[: cell.shape[0], x : x + side] = cell
+        sheet[:side, side : side + _GAP] = 160  # separator
+        caption = f"#{k:02d} cos={p['cosine']:.4f}  {p['a']} ({p['group_a']})  |  {p['b']} ({p['group_b']})"
+        cv2.putText(sheet, caption, (6, side + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, 0, 1, cv2.LINE_AA)
+        Image.fromarray(sheet).save(out / f"pair_{k:02d}.png", optimize=True)
+    print(f"{len(pairs)} pair sheets -> {out}")
+    return 0
+
+
+
 # --------------------------------------------------------------------- CLI ---
 
 
@@ -432,6 +525,20 @@ def main(argv: list[str] | None = None) -> int:
     br.add_argument("--required", type=float, default=0.99, help="required fraction of objects with IoU >= min-iou")
     br.add_argument("--workers", type=int, default=16)
     br.set_defaults(func=cmd_bbox_raster)
+
+    ov = sub.add_parser("overlays", help="draw the labels of n random images of a built D or W dataset")
+    ov.add_argument("--dataset", type=Path, required=True, help="dataset folder holding data.yaml, images/, labels/")
+    ov.add_argument("--out", type=Path, required=True)
+    ov.add_argument("--n", type=int, default=50)
+    ov.add_argument("--seed", type=int, default=0)
+    ov.set_defaults(func=cmd_overlays)
+
+    ps = sub.add_parser("pair-sheet", help="side-by-side ink tiles of the cross-space candidate pairs in stats.json")
+    ps.add_argument("--stats", type=Path, required=True, help="manifests/stats.json of a build")
+    ps.add_argument("--src", type=Path, required=True, help="FloorPlanCAD root (holds train-00, ...)")
+    ps.add_argument("--out", type=Path, required=True)
+    ps.add_argument("--size", type=int, default=640, help="side of each tile in the sheet, px")
+    ps.set_defaults(func=cmd_pair_sheet)
 
     args = ap.parse_args(argv)
     return args.func(args)

@@ -32,5 +32,7 @@ classes:
   - {schema_id: 29, semantic_id: 31, name: elevator, group: vertical-circulation, model: D}
   - {schema_id: 30, semantic_id: 32, name: escalator, group: vertical-circulation, model: D}
   - {schema_id: 31, semantic_id: 1, name: wall, group: wall, model: W}
-  - {schema_id: 32, semantic_id: 2, name: curtain_wall, group: wall, model: W, enabled: false}
-  - {schema_id: 33, semantic_id: 33, name: railing, group: wall, model: W, enabled: false}
+  # curtain_wall and railing: enabled after the build v0 closure check (stats.json w_candidates:
+  # median coverage 1.0 over 1,843 / 2,376 kept tiles >= 0.80); see reports/qa/README.md.
+  - {schema_id: 32, semantic_id: 2, name: curtain_wall, group: wall, model: W}
+  - {schema_id: 33, semantic_id: 33, name: railing, group: wall, model: W}

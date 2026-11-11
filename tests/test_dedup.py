@@ -143,3 +143,13 @@ def test_clusters_numbering_stable_and_transitive():
     assert cid[tiles[0]] == cid[tiles[2]] == cid[tiles[3]]
     assert cid[tiles[1]] == 0 and cid[tiles[0]] == 1
     assert build_clusters(tiles[::-1], [(3, 1), (1, 0)]) == cid
+
+
+def test_clusters_manual_merges_join_groups_before_numbering():
+    tiles = [("train-00", "0001-0001"), ("train-00", "0002-0001"),
+             ("train-01", "0003-0001"), ("test-00", "0004-0001")]
+    assert len(set(build_clusters(tiles, []).values())) == 4
+    cid = build_clusters(tiles, [], merges=[(("A", "0002"), ("B", "0004"))])
+    assert cid[tiles[1]] == cid[tiles[3]]
+    assert sorted(set(cid.values())) == [0, 1, 2]  # still numbered 0..n-1
+    assert cid[tiles[0]] == 0 and cid[tiles[1]] == 1 and cid[tiles[2]] == 2

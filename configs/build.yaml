@@ -1,0 +1,20 @@
+# Dataset build v0 (python -m fpyolo.build --config configs/build.yaml ...). Spec §6.3-6.6.
+schema: classes_v0.yaml          # relative to this file
+archives: [train-00, train-01, test-00]
+split_mode: cluster              # cluster: stratified 70/10/20 by building cluster; official: test = test-00
+ratios: [0.7, 0.1, 0.2]          # train / val / test, counted in tiles
+seed: 0
+near_dup: {threshold: 0.95, min_ink: 0.01, thumb: 32}   # cosine on thumb x thumb ink thumbnails
+boxes: {min_side_px: 2, min_visible: 0.30}
+walls:
+  gap_px: 3
+  max_thickness_px: 60
+  cap_px: 32                     # end caps for open wall ends (Task 5 ruling R10)
+  coverage_min: 0.80
+  stop_if_excluded_frac: 0.30
+  candidates: [2, 33]            # curtain wall, railing: enabled by hand in classes_v0.yaml, never here
+  candidate_enable_median_cov: 0.80
+core: {min_train: 50, min_test: 15}
+# Forced drawing-group merges, a list of group pairs with quoted numbers:
+#   manual_merges: [[["A", "0012"], ["B", "0731"]]]
+manual_merges: []

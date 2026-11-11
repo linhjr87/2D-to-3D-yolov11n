@@ -1,5 +1,6 @@
 """Exact dedup, ink thumbnails, near-duplicate pairs and building clusters."""
 from collections import defaultdict
+from collections.abc import Iterable
 
 import cv2
 import numpy as np
@@ -78,17 +79,25 @@ class UnionFind:
             self.parent[max(ra, rb)] = min(ra, rb)  # smaller key stays the root
 
 
-def build_clusters(tiles: list[TileId], pairs: list[tuple[int, int]]) -> dict[TileId, int]:
+def build_clusters(
+    tiles: list[TileId],
+    pairs: list[tuple[int, int]],
+    merges: Iterable[tuple[tuple[str, str], tuple[str, str]]] = (),
+) -> dict[TileId, int]:
     """Cluster id per tile: drawing groups merged through near-duplicate pairs.
 
-    All tiles of a drawing group share a cluster. Ids start at 0, ordered by
-    the smallest drawing group of each cluster (independent of input order).
+    `merges` are extra (group, group) unions decided by a human, e.g.
+    ``(("A", "0012"), ("B", "0731"))``. All tiles of a drawing group share a
+    cluster. Ids start at 0, ordered by the smallest drawing group of each
+    cluster (independent of input order).
     """
     uf = UnionFind()
     for t in tiles:
         uf.find(drawing_group(t))
     for i, j in pairs:
         uf.union(drawing_group(tiles[i]), drawing_group(tiles[j]))
+    for g1, g2 in merges:
+        uf.union(tuple(g1), tuple(g2))
     roots = sorted({uf.find(drawing_group(t)) for t in tiles})
     number = {root: n for n, root in enumerate(roots)}
     return {t: number[uf.find(drawing_group(t))] for t in tiles}
