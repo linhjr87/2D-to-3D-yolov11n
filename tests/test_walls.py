@@ -82,6 +82,7 @@ def test_hatch_lines_merged(tmp_path):
     assert len(res.polygons) == 1
     assert len(res.polygons[0].interiors) == 0
     assert res.polygons[0].area == pytest.approx(0.5 * 0.03, rel=1e-3)
+    assert res.coverage >= 0.99  # hatching inside the body counts as covered
 
 
 def test_gap_closing(tmp_path):
@@ -93,6 +94,52 @@ def test_gap_closing(tmp_path):
     res = _walls(tmp_path, *strokes, gap_px=1.0)
     assert res.polygons == []
     assert res.coverage < 0.5
+
+
+def _wall_lines(x0, x1, closed_left=True, closed_right=True):
+    """A wall x0..x1 by 50..52 units drawn as separate lines, like the real data."""
+    lines = [_path(f"M {x0} 50 L {x1} 50"), _path(f"M {x0} 52 L {x1} 52")]
+    if closed_left:
+        lines.append(_path(f"M {x0} 50 L {x0} 52"))
+    if closed_right:
+        lines.append(_path(f"M {x1} 50 L {x1} 52"))
+    return lines
+
+
+def test_end_cap_closes_open_wall_end(tmp_path):
+    # two parallel strokes 20 px apart end at x=40 (a door), the other end is closed
+    strokes = _wall_lines(10, 40, closed_right=False)
+    res = _walls(tmp_path, *strokes)
+    assert len(res.polygons) == 1
+    assert res.polygons[0].bounds == pytest.approx((0.10, 0.50, 0.40, 0.52), abs=1e-6)
+    assert _walls(tmp_path, *strokes, cap_px=0).polygons == []  # the cap closes it
+
+
+@pytest.mark.parametrize("closed_ends", [True, False])
+def test_door_opening_between_walls_not_bridged(tmp_path, closed_ends):
+    # collinear walls 10..40 and 49..80 face each other across a 90 px opening
+    res = _walls(
+        tmp_path,
+        *_wall_lines(10, 40, closed_right=closed_ends),
+        *_wall_lines(49, 80, closed_left=closed_ends),
+    )
+    assert len(res.polygons) == 2
+    opening = box(0.40, 0.50, 0.49, 0.52)
+    assert all(p.intersection(opening).area < 1e-9 for p in res.polygons)
+
+
+def test_end_not_capped_along_stroke_direction(tmp_path):
+    # the top line of wall 10..60 x 50..52 has a 20 px break (x 30..32): its two
+    # ends are 20 px apart but the joining segment is parallel to the strokes
+    res = _walls(
+        tmp_path,
+        _path("M 10 50 L 30 50"),
+        _path("M 32 50 L 60 50"),
+        _path("M 10 52 L 60 52"),
+        _path("M 10 50 L 10 52"),
+        _path("M 60 50 L 60 52"),
+    )
+    assert res.polygons == []
 
 
 def test_no_wall_strokes(tmp_path):

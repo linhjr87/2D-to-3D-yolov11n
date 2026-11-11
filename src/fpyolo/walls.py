@@ -1,7 +1,8 @@
 """YOLO segmentation labels (model W): wall-body polygons from wall strokes.
 
-Walls are drawn as closed outlines (two parallel strokes closed at the ends),
-sometimes hatched inside, and cut at the image border. All geometry is built in
+Walls are drawn as two parallel strokes, usually closed at the ends (open ends,
+e.g. at door openings, are capped here), sometimes hatched inside, and cut at
+the image border. All geometry is built in
 pixels of the true image size and converted to normalized [0, 1] coordinates
 (SVG coordinate / viewBox size) at the end.
 """
@@ -15,7 +16,9 @@ from fpyolo.svgparse import Tile
 
 SIMPLIFY_PX = 0.05  # drop (near-)collinear samples before noding; far below a pixel
 GRID_PX = 1e-3  # snap-rounding grid for noding: merges endpoints that differ by float noise
-COVERAGE_TOL_PX = 1.5  # a stroke this close to the region boundary counts as covered
+COVERAGE_TOL_PX = 1.5  # a stroke this close to the region (boundary or interior) is covered
+CAP_PX = 32.0  # end cap: max distance between the two lines of an open wall end
+CAP_MAX_ANGLE_DEG = 30.0  # end cap: max deviation from perpendicular to the stroke ends
 _FRAME_EPS_PX = 1e-6
 
 
@@ -40,24 +43,77 @@ def _stroke_lines(tile: Tile, semantic_ids: set[int], img_w: int, img_h: int) ->
     return shapely.simplify(arr, SIMPLIFY_PX, preserve_topology=False)
 
 
-def _gap_segments(lines: np.ndarray, gap_px: float) -> np.ndarray:
-    """Join each free stroke end to its nearest other stroke when 0 < distance < gap_px."""
-    starts, ends = shapely.get_point(lines, 0), shapely.get_point(lines, -1)
-    is_open = shapely.distance(starts, ends) > 0
+def _open_ends(lines: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Both ends of every open stroke: (Points, owning stroke index, outward unit direction)."""
+    first, last = shapely.get_point(lines, 0), shapely.get_point(lines, -1)
+    is_open = shapely.distance(first, last) > 0
+    sub = lines[is_open]
+    c = [shapely.get_coordinates(shapely.get_point(sub, k)) for k in (0, 1, -1, -2)]
+    dirs = np.concatenate([c[0] - c[1], c[2] - c[3]])
+    dirs /= np.maximum(np.linalg.norm(dirs, axis=1, keepdims=True), 1e-12)
     owner = np.concatenate([np.flatnonzero(is_open)] * 2)
-    pts = np.concatenate([starts[is_open], ends[is_open]])
+    return np.concatenate([first[is_open], last[is_open]]), owner, dirs
+
+
+def _nearest_other(
+    lines: np.ndarray, pts: np.ndarray, owner: np.ndarray, radius: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per end: (index, distance) of the nearest other stroke within radius, else (-1, inf)."""
+    near_l, near_d = np.full(len(pts), -1), np.full(len(pts), np.inf)
     if len(pts) == 0:
-        return np.empty(0, dtype=object)
-    e, l = shapely.STRtree(lines).query(pts, predicate="dwithin", distance=gap_px)
+        return near_l, near_d
+    e, l = shapely.STRtree(lines).query(pts, predicate="dwithin", distance=radius)
     other = l != owner[e]
     e, l = e[other], l[other]
     d = shapely.distance(pts[e], lines[l])
-    order = np.lexsort((d, e))  # per endpoint, nearest other stroke first
+    order = np.lexsort((d, e))  # per end, nearest other stroke first
     e, l, d = e[order], l[order], d[order]
     first = np.unique(e, return_index=True)[1]
-    e, l, d = e[first], l[first], d[first]
-    gap = (d > 0) & (d < gap_px)
-    return shapely.shortest_line(pts[e[gap]], lines[l[gap]])
+    near_l[e[first]], near_d[e[first]] = l[first], d[first]
+    return near_l, near_d
+
+
+def _gap_segments(
+    lines: np.ndarray, pts: np.ndarray, near_l: np.ndarray, near_d: np.ndarray, gap_px: float
+) -> np.ndarray:
+    """Join each end to its nearest other stroke when 0 < distance < gap_px."""
+    gap = (near_d > 0) & (near_d < gap_px)
+    return shapely.shortest_line(pts[gap], lines[near_l[gap]])
+
+
+def _end_caps(pts: np.ndarray, owner: np.ndarray, dirs: np.ndarray, cap_px: float) -> np.ndarray:
+    """Close open wall ends: join two ends of different strokes up to cap_px apart.
+
+    A cap must be within CAP_MAX_ANGLE_DEG of perpendicular to the end
+    direction of both strokes. This closes the two parallel lines of a wall
+    stopping at a door opening, but never bridges collinear wall ends facing
+    each other across an opening. Nearest pairs are taken first and each end
+    gets at most one cap.
+    """
+    if cap_px <= 0 or len(pts) < 2:
+        return np.empty(0, dtype=object)
+    i, j = shapely.STRtree(pts).query(pts, predicate="dwithin", distance=cap_px)
+    keep = (i < j) & (owner[i] != owner[j])
+    i, j = i[keep], j[keep]
+    xy = shapely.get_coordinates(pts)
+    v = xy[j] - xy[i]
+    dist = np.linalg.norm(v, axis=1)
+    s = v / np.maximum(dist, 1e-12)[:, None]
+    max_cos = np.sin(np.radians(CAP_MAX_ANGLE_DEG))  # |cos(angle to end direction)|
+    ok = (
+        (dist > 0)
+        & (np.abs((s * dirs[i]).sum(1)) <= max_cos)
+        & (np.abs((s * dirs[j]).sum(1)) <= max_cos)
+    )
+    used: set[int] = set()
+    caps = []
+    for k in np.flatnonzero(ok)[np.argsort(dist[ok], kind="stable")]:
+        if i[k] not in used and j[k] not in used:
+            used.update((i[k], j[k]))
+            caps.append(shapely.LineString([xy[i[k]], xy[j[k]]]))
+    out = np.empty(len(caps), dtype=object)
+    out[:] = caps
+    return out
 
 
 def _clip_to_frame(lines: np.ndarray, img_w: int, img_h: int) -> np.ndarray:
@@ -98,11 +154,15 @@ def _wall_face_mask(
 
 
 def _coverage(strokes: np.ndarray, region: shapely.Geometry, total: float) -> float:
-    """Fraction of stroke length within COVERAGE_TOL_PX of the region boundary."""
+    """Fraction of stroke length within COVERAGE_TOL_PX of the region.
+
+    Boundary or interior: hatching inside a wall body is also a wall stroke and
+    is explained by the region.
+    """
     if region.is_empty:
         return 0.0
-    band = shapely.buffer(shapely.boundary(region), COVERAGE_TOL_PX)
-    return float(shapely.length(shapely.intersection(strokes, band)).sum() / total)
+    near = shapely.buffer(region, COVERAGE_TOL_PX)
+    return float(shapely.length(shapely.intersection(strokes, near)).sum() / total)
 
 
 def wall_regions(
@@ -113,23 +173,37 @@ def wall_regions(
     gap_px: float = 3.0,
     max_thickness_px: float = 60.0,
     max_border_frac: float = 0.4,
+    cap_px: float = CAP_PX,
 ) -> WallResult:
     """Wall bodies of one tile: one polygon per connected wall region.
 
-    Strokes of `semantic_ids` are scaled to pixels, small gaps between a free
-    end and another stroke are bridged, everything is clipped to the image,
-    noded together with the image frame and polygonized. Faces that are thin
-    (wall bodies, not rooms) and not mostly on the frame (not border slivers)
-    are merged; each connected component is one polygon. Coverage is measured
-    on the strokes inside the image, before gap closing.
+    Strokes of `semantic_ids` are scaled to pixels. Two kinds of closing
+    segments are added: a stroke end closer than `gap_px` to another stroke is
+    joined to it, and the still-free ends of two parallel wall lines stopping
+    side by side (up to `cap_px` apart, see `_end_caps`) are capped.
+    Everything is clipped to the image, noded together with the image frame
+    and polygonized. Faces that are thin (wall bodies, not rooms) and not
+    mostly on the frame (not border slivers) are merged; each connected
+    component is one polygon.
+
+    Coverage = length of the original strokes inside the image (before any
+    closing segment) lying within COVERAGE_TOL_PX of the region, boundary or
+    interior, divided by their total length.
     """
     lines = _stroke_lines(tile, semantic_ids, img_w, img_h)
     strokes = _clip_to_frame(lines, img_w, img_h)
     total = float(shapely.length(strokes).sum())
     if total == 0:
         return WallResult([], None, 0.0)
-    gaps = _clip_to_frame(_gap_segments(lines, gap_px), img_w, img_h)
-    faces = _faces(np.concatenate([strokes, gaps]), img_w, img_h)
+    pts, owner, dirs = _open_ends(lines)
+    near_l, near_d = _nearest_other(lines, pts, owner, gap_px)
+    closing = np.concatenate(
+        [
+            _gap_segments(lines, pts, near_l, near_d, gap_px),
+            _end_caps(pts, owner, dirs, cap_px),
+        ]
+    )
+    faces = _faces(np.concatenate([strokes, _clip_to_frame(closing, img_w, img_h)]), img_w, img_h)
     keep = _wall_face_mask(faces, img_w, img_h, max_thickness_px, max_border_frac)
     region = shapely.unary_union(faces[keep])
     scale = np.array([img_w, img_h], dtype=np.float64)
