@@ -38,8 +38,9 @@ nvidia-nvjitlink==13.5.37
 nvidia-nvshmem-cu13==3.7.2
 nvidia-nvtx==13.2.86
 opencv-python==5.0.0.93
-packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1785888127/work
+packaging==26.3
 pillow==13.0.0
+pip==26.2.2
 pluggy==1.7.0
 polars==2.1.0
 polars-runtime-32==2.1.0
