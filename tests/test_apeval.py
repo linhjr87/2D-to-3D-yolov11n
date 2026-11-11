@@ -237,6 +237,8 @@ def test_missing_class_listed_not_averaged():
 
 
 def test_weights_equal_duplication():
+    """Tie-free by construction: random float scores never tie within an image, so
+    weighting equals literal duplication through build_cache."""
     gts, preds = random_data(0)
     cache = build_cache(gts, preds)
     weights = {k: 1 for k in gts}
@@ -257,6 +259,23 @@ def test_weights_equal_duplication():
                                    ap_table(dup, [0, 1, 2], area=area), rtol=0, atol=1e-12)
 
 
+def test_weights_convention_at_within_image_score_ties():
+    """Weight k keeps each detection's k copies adjacent in score order; literal
+    duplication keeps image blocks instead, so the two differ when detections of one
+    image and class tie on score."""
+    gts = {"a": gt([[0, 0, 50, 50], [100, 100, 150, 150]], [0, 0]), "b": gt([[0, 0, 50, 50]], [0])}
+    preds = {"a": pred([[0, 0, 50, 50], [300, 300, 350, 350]], [0, 0], [0.5, 0.5]),  # TP, FP tied
+             "b": pred([[0, 0, 50, 50]], [0], [0.4])}
+    weighted = ap_table(build_cache(gts, preds), [0], weights={"a": 2, "b": 1})
+    # copies adjacent: TP TP FP FP TP -> precision 1 up to recall 2/5, then 3/5 at recall 3/5:
+    # AP50 = (41 * 1 + 20 * 3/5) / 101 = 53/101 = 0.5248
+    assert weighted[0, 0] == pytest.approx(53 / 101, abs=1e-12)
+    # literal duplication ("a~" sorts right after "a"): TP FP TP FP TP ->
+    # AP50 = (21 * 1 + 20 * 2/3 + 20 * 3/5) / 101 = 139/303 = 0.4587
+    dup = build_cache({**gts, "a~": gts["a"]}, {**preds, "a~": preds["a"]})
+    assert ap_table(dup, [0])[0, 0] == pytest.approx(139 / 303, abs=1e-12)
+
+
 def test_bootstrap_identical_models():
     gts, preds = random_data(0)
     cache = build_cache(gts, preds)
@@ -275,6 +294,29 @@ def test_bootstrap_sign_and_degenerate_resamples():
     # A is perfect, B predicts nothing: every resample gives A - B = 1, even those without class 1
     assert (r["delta"], r["ci_low"], r["ci_high"]) == (1.0, 1.0, 1.0)
     assert 0 < r["n_degenerate"] < 200
+
+
+def test_bootstrap_resamples_without_any_core_class():
+    # the only core class (1) lives in cluster 0 of 4: resamples that miss cluster 0 have
+    # no headline, are counted as degenerate and left out of the percentiles
+    gts = {f"im{i}": gt([[10, 10, 60, 60]], [0]) for i in range(8)}
+    gts["im0"] = gt([[10, 10, 60, 60], [100, 100, 150, 150]], [0, 1])
+    perfect = {k: (b, l, np.ones(len(l))) for k, (b, l) in gts.items()}
+    a, b = build_cache(gts, perfect), build_cache(gts, {})
+    cluster_of = {f"im{i}": i // 2 for i in range(8)}
+    r = bootstrap_delta([a], [b], core=[1], cluster_of=cluster_of, n=200, seed=0)
+    # 1 - 2e-16: a single true positive has COCO precision 1 / (1 + eps)
+    assert (r["delta"], r["ci_low"], r["ci_high"]) == pytest.approx((1.0, 1.0, 1.0), abs=1e-12)
+    assert 0 < r["n_degenerate"] < 200
+    # with one resample per seed, the seeds that miss cluster 0 leave no finite delta
+    raised = 0
+    for seed in range(10):
+        try:
+            bootstrap_delta([a], [b], core=[1], cluster_of=cluster_of, n=1, seed=seed)
+        except ValueError as e:
+            assert "finite" in str(e)
+            raised += 1
+    assert 0 < raised < 10
 
 
 def test_bootstrap_is_seeded():

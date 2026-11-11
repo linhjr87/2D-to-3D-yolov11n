@@ -9,12 +9,16 @@ concatenated in image-id order and stably sorted by score.
 
 How weights avoid re-matching: `build_cache` matches once and keeps, per area range
 and IoU threshold, only the true positives and a few correction entries (see
-`_AreaTable`). An image with weight k counts as k copies of itself. At each true
-positive, weighted TP and TP+FP counts are cumulative sums of the image weights, so
-`ap_table(..., weights=...)` is a few vectorized passes over the cached arrays.
-Duplicates of one detection share a score, so they form one run of identical
-outcomes; collapsing such a run into one weighted point leaves the interpolated
-precision unchanged.
+`_AreaTable`). At each true positive, weighted TP and TP+FP counts are cumulative
+sums of the image weights, so `ap_table(..., weights=...)` is a few vectorized passes
+over the cached arrays.
+
+Weight convention: weight k behaves as k copies of the image whose copies sit
+immediately after the original in image-id order, with each detection's k copies
+adjacent in the score-sorted order. This equals literal duplication through
+`build_cache` except where detections tie on score within one image and class
+(literal copies then form image blocks), and at cross-image score ties when literal
+duplicate keys would sort elsewhere.
 """
 from __future__ import annotations
 
@@ -151,6 +155,14 @@ def _area_table(tp, corr, in_area, det_cls, class_lo, n_cls, n_gt) -> _AreaTable
     bounds = bounds[bounds < n_det]
     corr_t, corr_det = np.nonzero(corr)
     corr_key = corr_t * n_det + corr_det
+    # Index bookkeeping; every searched array is sorted, keys t * D + index order
+    # (threshold, position) like the TP and correction lists:
+    # - tp_seg_lo, side "left" on tp_seg: first TP of the TP's own segment.
+    # - tp_hi: where tp_det + 1 sits in bounds, so cum[tp_hi] includes the TP itself;
+    #   tp_det + 1 == D is not in bounds and maps to U, the total.
+    # - tp_lo: where the class start sits in bounds (always present).
+    # - corr_upto, side "right": a correction on the TP itself is included.
+    # - corr_lo, side "left" on the segment start: earlier segments are excluded.
     return _AreaTable(
         in_area=None if in_area.all() else in_area,
         n_gt=n_gt,
@@ -309,8 +321,9 @@ def ap_table(cache: EvalCache, classes: Sequence[int], area: str = "all",
              weights: Mapping[str, int] | None = None) -> np.ndarray:
     """(C, 10) AP per class and IoU threshold; NaN for a class without labels.
 
-    `weights` are per-image multiplicities: weight k counts the image k times, and
-    images absent from `weights` count 0 times.
+    `weights` are per-image multiplicities: weight k counts the image as k copies
+    (exact convention at score ties: module docstring), and images absent from
+    `weights` count 0 times.
     """
     if area not in AREA_RANGES:
         raise ValueError(f"area must be one of {list(AREA_RANGES)}, got {area!r}")
@@ -362,8 +375,10 @@ def bootstrap_delta(caches_a: Sequence[EvalCache], caches_b: Sequence[EvalCache]
     replacement (as many draws as clusters); an image's weight is how often its
     cluster was drawn, and the same draw weights every cache of A and B. A resample
     that leaves a core class without labels averages over the core classes it still
-    has; such iterations are counted in `n_degenerate`. `delta` is the estimate on
-    the original data; `ci_low`/`ci_high` are the 2.5th/97.5th percentiles.
+    has; such iterations are counted in `n_degenerate`. One that loses every core
+    class has no delta: it is counted too and left out of the percentiles (ValueError
+    if no iteration has a delta). `delta` is the estimate on the original data;
+    `ci_low`/`ci_high` are the 2.5th/97.5th percentiles.
     """
     caches_a, caches_b = list(caches_a), list(caches_b)
     if not caches_a or not caches_b or n < 1:
@@ -394,6 +409,9 @@ def bootstrap_delta(caches_a: Sequence[EvalCache], caches_b: Sequence[EvalCache]
         counts = np.bincount(rng.integers(0, len(clusters), len(clusters)), minlength=len(clusters))
         deltas[j], absent = delta(counts)
         n_degenerate += bool(absent)
-    ci_low, ci_high = np.percentile(deltas, [2.5, 97.5])
+    finite = deltas[np.isfinite(deltas)]
+    if not len(finite):
+        raise ValueError("every resample lost all core classes: no finite delta")
+    ci_low, ci_high = np.percentile(finite, [2.5, 97.5])
     return {"delta": point, "ci_low": float(ci_low), "ci_high": float(ci_high),
             "n_degenerate": n_degenerate}
