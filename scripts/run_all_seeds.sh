@@ -153,7 +153,7 @@ run_job() {  # run_job "<job row>" <gpu>  -> 0 ok/skipped, 1 failed
         mv "$log" "$log.$(date -u +%Y%m%dT%H%M%SZ).old"
     fi
     # the attempt header: fpyolo.runstate.ATTEMPT_MARKER, verify only reads the log after the last one
-    { echo "=== fpyolo-attempt $(stamp) GPU $gpu: $action $(quote "${cmd[@]}")"; } >>"$log"
+    { echo; echo "=== fpyolo-attempt $(stamp) GPU $gpu: $action $(quote "${cmd[@]}")"; } >>"$log"
     run_logged "$log" "${cmd[@]}" || rc=$?
     if [ "$rc" -ne 0 ]; then
         echo "[GPU $gpu] $(stamp) $name: FAILED (exit $rc), last log line: $(tail -n 1 "$log")" \

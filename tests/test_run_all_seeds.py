@@ -175,7 +175,7 @@ def test_start_rotates_an_existing_log_and_writes_an_attempt_header(tmp_path):
     (old,) = runs.glob("d11n_s0.log.*.old")
     assert old.read_text() == "old attempt: Reducing to batch=16\n"
     log = (runs / "d11n_s0.log").read_text()
-    assert log.startswith(ATTEMPT_MARKER) and "Reducing to batch" not in log
+    assert log.startswith("\n" + ATTEMPT_MARKER) and "Reducing to batch" not in log
     assert log.count(ATTEMPT_MARKER) == 1
 
 
@@ -186,7 +186,7 @@ def test_resume_appends_to_the_log_without_rotating(tmp_path):
     (runs / "d8n_s0.log").write_text("first attempt\n")
     assert _run(_env(tmp_path, GPUS="0", STUB_SLEEP="0")).returncode == 0
     assert not list(runs.glob("d8n_s0.log.*.old"))
-    assert (runs / "d8n_s0.log").read_text().startswith("first attempt\n=== fpyolo-attempt")
+    assert (runs / "d8n_s0.log").read_text().startswith("first attempt\n\n=== fpyolo-attempt")
 
 
 def test_script_and_runstate_share_the_attempt_marker():

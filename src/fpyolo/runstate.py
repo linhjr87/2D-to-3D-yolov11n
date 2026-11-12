@@ -213,7 +213,7 @@ def _last_attempt_has_batch_warning(log: Path) -> bool:
     hit = False
     with open(log, errors="replace") as f:
         for line in f:
-            if line.startswith(ATTEMPT_MARKER):
+            if ATTEMPT_MARKER in line:
                 hit = False
             elif BATCH_WARNING in line:
                 hit = True

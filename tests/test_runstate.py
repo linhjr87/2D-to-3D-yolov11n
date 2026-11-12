@@ -378,3 +378,12 @@ def test_verify_cli_expected_batch_from_config(tmp_path):
     logged = subprocess.run([sys.executable, "-m", "fpyolo.runstate", "verify", str(run), "--config", str(cfg),
                              "--log", str(log), "--no-nvidia-smi"], capture_output=True, text=True)
     assert logged.returncode == 1 and "lowered the batch" in logged.stdout
+
+
+def test_attempt_marker_glued_to_an_unterminated_line(tmp_path):
+    """A run killed mid progress bar leaves no trailing newline; the next header must still count."""
+    from fpyolo.runstate import ATTEMPT_MARKER, _last_attempt_has_batch_warning
+
+    log = tmp_path / "x.log"
+    log.write_text("Reducing to batch 16\n 4/30 progress" + ATTEMPT_MARKER + " resume\nclean epoch\n")
+    assert not _last_attempt_has_batch_warning(log)
