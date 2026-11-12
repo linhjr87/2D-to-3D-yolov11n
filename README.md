@@ -92,8 +92,8 @@ done
 
 | | batch | note |
 |---|---|---|
-| D (yolo11n and yolov8n) | 32 (config default) | not yet trialled on the GPU server |
-| W (yolo11n-seg) | 32 (config default) | not yet trialled on the GPU server |
+| D (yolo11n and yolov8n) | 32 (config default) | 2026-11-12 trial on an RTX A5000 (24 GB): peak 12.2 GB (yolo11n) / 11.6 GB (yolov8n), no batch reduction; ~1 min per training epoch |
+| W (yolo11n-seg) | 32 (config default) | 2026-11-12 trial on an RTX A5000 (24 GB): peak 13.6 GB, no batch reduction |
 
 Afterwards remove the trial: `rm -rf runs/trial`.
 
