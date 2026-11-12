@@ -2,9 +2,10 @@
 
 Each run directory is an evaluate_d output. The label set is rebuilt from the dataset and
 split recorded in the runs' metrics.json, predictions come from each run's preds.npz, and
-the headline of every run is recomputed with the core classes of --manifest. A difference
-is "real" when the 95% cluster-bootstrap CI excludes 0 and |delta| > 2 * pooled std,
-pooled std = sqrt((sa^2 + sb^2) / 2), with sa, sb the sample (ddof=1) std over seeds.
+the headline of every run is recomputed with the core classes of --manifest. All runs must
+record the same schema, equal to --schema, and the dataset's class names must be the D
+classes of that schema. A difference is "real" when the 95% cluster-bootstrap CI excludes 0
+and |delta| > 2 * pooled std, pooled std = sqrt((sa^2 + sb^2) / 2), with sa, sb the sample (ddof=1) std over seeds.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
+import yaml
 
 from fpyolo.apeval import bootstrap_delta, build_cache, summarize
 from fpyolo.evaluate_d import class_key, core_indices, load_split_gt, read_preds, write_json
@@ -67,8 +69,20 @@ def compare(a_dirs: Sequence[Path], b_dirs: Sequence[Path], manifest: Path,
         raise ValueError(f"--manifest {manifest} is not the manifest of the runs: {sorted(recorded)}")
 
     schema_path = Path(schema_path).resolve()
+    recorded = {m.get("schema") for m in metas}
+    if None in recorded:
+        raise ValueError("a run's metrics.json records no schema; re-run evaluate_d")
+    recorded = {str(Path(s).resolve()) for s in recorded}
+    if len(recorded) != 1:
+        raise ValueError(f"the runs disagree on schema: {sorted(recorded)}")
+    if recorded != {str(schema_path)}:
+        raise ValueError(f"--schema {schema_path} is not the schema of the runs: {recorded.pop()}")
     schema = load_schema(schema_path)
     names = schema.yolo_names("D")
+    data_yaml = Path(dataset) / "data.yaml"
+    data_names = yaml.safe_load(data_yaml.read_text(encoding="utf-8"))["names"]
+    if {int(k): v for k, v in data_names.items()} != names:
+        raise ValueError(f"{data_yaml} class names differ from the D classes of {schema_path}")
     core, all_classes = core_indices(manifest, schema), sorted(names)
     gts = load_split_gt(Path(dataset), split, limit)
     caches, heads = [], []

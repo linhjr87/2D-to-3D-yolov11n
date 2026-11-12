@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 import shapely
 import torch
+import yaml
 from PIL import Image
 
 from conftest import CONFIGS, REPO
@@ -237,11 +238,20 @@ def test_ultralytics_val_trims_heap_and_pins_loader(spaced_tmp, monkeypatch):
     assert kw["project"] == str(spaced_tmp) and kw["name"] == "out" and kw["exist_ok"] is True
 
 
+SCHEMA_V0 = CONFIGS / "classes_v0.yaml"
+
+
+def _write_data_yaml(root, model="D"):
+    names = load_schema(SCHEMA_V0).yolo_names(model)
+    (root / "data.yaml").write_text(yaml.safe_dump({"path": str(root), "names": names}), encoding="utf-8")
+
+
 def _write_run(run_dir, preds, dataset, manifests, split="test"):
     run_dir.mkdir(parents=True)
     write_preds(run_dir / "preds.npz", preds)
     write_json(run_dir / "metrics.json", {"dataset": str(dataset), "split": split,
-                                          "manifest": str(manifests), "limit": None})
+                                          "manifest": str(manifests), "limit": None,
+                                          "schema": str(SCHEMA_V0.resolve())})
 
 
 def _compare_setup(root):
@@ -251,6 +261,7 @@ def _compare_setup(root):
     label = "".join(f"{c} {(x0 + x1) / 200} {(y0 + y1) / 200} {(x1 - x0) / 100} {(y1 - y0) / 100}\n"
                     for c, (x0, y0, x1, y1) in enumerate(gt_boxes))
     ds = _dataset(root / "data" / "D", "test", {k: ((100, 100), label) for k in ids})
+    _write_data_yaml(ds)
     man = root / "data" / "manifests"
     man.mkdir(parents=True)
     with open(man / "tiles.csv", "w", newline="", encoding="utf-8") as f:
@@ -305,6 +316,126 @@ def test_compare_rejects_mixed_splits(spaced_tmp):
     write_json(spaced_tmp / "runs" / "b" / "metrics.json", dict(meta, split="val"))
     with pytest.raises(ValueError, match="split"):
         compare_main(["--a", a, "--b", b, "--manifest", str(man), "--out", str(spaced_tmp / "c.json")])
+
+
+def _set_meta(run_dir, **kw):
+    meta = json.loads((Path(run_dir) / "metrics.json").read_text(encoding="utf-8"))
+    write_json(Path(run_dir) / "metrics.json", dict(meta, **kw))
+
+
+def test_compare_requires_one_schema(spaced_tmp):
+    man, run = _compare_setup(spaced_tmp)
+    a, b = run("a", 0.0), run("b", 1.0)
+    out = str(spaced_tmp / "c.json")
+    other = spaced_tmp / "classes_other.yaml"
+    other.write_text(SCHEMA_V0.read_text(encoding="utf-8"), encoding="utf-8")
+    _set_meta(b, schema=str(other))
+    with pytest.raises(ValueError, match="disagree on schema"):
+        compare_main(["--a", a, "--b", b, "--manifest", str(man), "--out", out])
+    _set_meta(a, schema=str(other))  # both runs agree, but not with --schema (the default)
+    with pytest.raises(ValueError, match="--schema .* is not the schema of the runs"):
+        compare_main(["--a", a, "--b", b, "--manifest", str(man), "--out", out])
+    assert compare_main(["--a", a, "--b", b, "--manifest", str(man), "--out", out,
+                         "--schema", str(other)]) == 0
+    _set_meta(a, schema=None)
+    with pytest.raises(ValueError, match="records no schema"):
+        compare_main(["--a", a, "--b", b, "--manifest", str(man), "--out", out, "--schema", str(other)])
+
+
+def test_compare_checks_dataset_class_names(spaced_tmp):
+    man, run = _compare_setup(spaced_tmp)
+    a, b = run("a", 0.0), run("b", 1.0)
+    data_yaml = spaced_tmp / "data" / "D" / "data.yaml"
+    doc = yaml.safe_load(data_yaml.read_text(encoding="utf-8"))
+    doc["names"][0], doc["names"][1] = doc["names"][1], doc["names"][0]
+    data_yaml.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    with pytest.raises(ValueError, match="class names differ from the D classes"):
+        compare_main(["--a", a, "--b", b, "--manifest", str(man), "--out", str(spaced_tmp / "c.json")])
+
+
+class _NamedModel:
+    def __init__(self, names):
+        self.names = names
+
+
+@pytest.mark.parametrize("key", ["D", "W"])
+def test_check_weights_against_schema(monkeypatch, key):
+    import ultralytics
+
+    from fpyolo.evaluate_d import check_weights
+
+    schema = load_schema(SCHEMA_V0)
+    names = schema.yolo_names(key)
+    monkeypatch.setattr(ultralytics, "YOLO", lambda weights: _NamedModel(dict(names)))
+    check_weights(Path("best.pt"), schema, key)
+    wrong = dict(names)
+    wrong[0] = "not_a_class"
+    monkeypatch.setattr(ultralytics, "YOLO", lambda weights: _NamedModel(wrong))
+    with pytest.raises(ValueError, match=f"best.pt: class names differ from the {key} classes"):
+        check_weights(Path("best.pt"), schema, key)
+
+
+def test_evaluate_d_refuses_mismatched_weights_before_predicting(spaced_tmp, monkeypatch):
+    import ultralytics
+
+    from fpyolo import evaluate_d
+
+    man, _ = _compare_setup(spaced_tmp)
+    w_names = load_schema(SCHEMA_V0).yolo_names("W")  # W weights passed to the D evaluation
+    monkeypatch.setattr(ultralytics, "YOLO", lambda weights: _NamedModel(w_names))
+    monkeypatch.setattr(evaluate_d, "predict_split", lambda *a, **k: pytest.fail("predicted"))
+    with pytest.raises(ValueError, match="class names differ from the D classes"):
+        evaluate_d.evaluate(spaced_tmp / "w.pt", spaced_tmp / "data" / "D", "test", man,
+                            spaced_tmp / "out", "cpu", SCHEMA_V0)
+
+
+def test_evaluate_w_refuses_mismatched_weights_before_predicting(spaced_tmp, monkeypatch):
+    import ultralytics
+
+    from fpyolo import evaluate_w
+
+    ds = _dataset(spaced_tmp / "W", "val", {"val-00_0000-0000": ((100, 100), None)})
+    _write_data_yaml(ds, "W")
+    d_names = load_schema(SCHEMA_V0).yolo_names("D")
+    monkeypatch.setattr(ultralytics, "YOLO", lambda weights: _NamedModel(d_names))
+    monkeypatch.setattr(evaluate_w, "predict_stream", lambda *a, **k: pytest.fail("predicted"))
+    with pytest.raises(ValueError, match="class names differ from the W classes"):
+        evaluate_w.evaluate(spaced_tmp / "d.pt", ds, spaced_tmp / "out", "cpu", schema_path=SCHEMA_V0)
+
+
+@pytest.mark.parametrize("module", ["evaluate_d", "evaluate_w"])
+def test_limit_only_on_cpu(module, spaced_tmp, monkeypatch, capsys):
+    import importlib
+
+    mod = importlib.import_module(f"fpyolo.{module}")
+    monkeypatch.setattr(mod, "evaluate", lambda *a, **k: pytest.fail("evaluated"))
+    monkeypatch.setattr(mod, "apply_device_env", lambda d: pytest.fail("device env set"))
+    args = ["--weights", "w.pt", "--dataset", str(spaced_tmp), "--out", str(spaced_tmp / "o"),
+            "--device", "0", "--limit", "5"]
+    if module == "evaluate_d":
+        args += ["--manifest", str(spaced_tmp)]
+    with pytest.raises(SystemExit) as e:
+        mod.main(args)
+    assert e.value.code == 2 and "--limit is for CPU smoke runs only" in capsys.readouterr().err
+
+
+def test_evaluate_w_main_passes_scale_conclusion(spaced_tmp, monkeypatch):
+    from fpyolo import evaluate_w
+
+    seen = {}
+
+    def fake_evaluate(*a, **k):
+        seen["args"] = a
+        return {"t_star": 0.5, "val_iou_at_t_star": 0.5, "test_pixel_iou": 0.5, "mask_map50_95": 0.5}
+
+    monkeypatch.setattr(evaluate_w, "evaluate", fake_evaluate)
+    monkeypatch.setattr(evaluate_w, "apply_device_env", lambda d: None)
+    base = ["--weights", "w.pt", "--dataset", str(spaced_tmp), "--out", str(spaced_tmp / "o"), "--device", "cpu"]
+    evaluate_w.main(base + ["--mm-per-px", "12.5"])
+    assert seen["args"][5:7] == (12.5, "user-supplied")
+    monkeypatch.setattr(evaluate_w, "default_scale", lambda: (10.0, "constant"))
+    evaluate_w.main(base)
+    assert seen["args"][5:7] == (10.0, "constant")
 
 
 def test_real_difference_rule():

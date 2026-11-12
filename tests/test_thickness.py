@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from fpyolo.evaluate_w import (
-    THICKNESS_METHOD, ThicknessErrors, default_mm_per_px, mask_thickness_px,
+    THICKNESS_METHOD, ThicknessErrors, default_mm_per_px, default_scale, mask_thickness_px,
 )
 
 
@@ -96,3 +96,25 @@ def test_default_mm_per_px_reads_scale_json(tmp_path):
     p.write_text(json.dumps({"overall_median": 10.0, "conclusion": "constant"}), encoding="utf-8")
     assert default_mm_per_px(p) == 10.0
     assert default_mm_per_px(tmp_path / "missing.json") is None
+
+
+def test_default_scale_returns_conclusion(tmp_path, capsys):
+    p = tmp_path / "scale.json"
+    p.write_text(json.dumps({"overall_median": 10.0, "conclusion": "constant"}), encoding="utf-8")
+    assert default_scale(p) == (10.0, "constant")
+    p.write_text(json.dumps({"overall_median": 9.0, "conclusion": "varies"}), encoding="utf-8")
+    assert default_scale(p) == (9.0, "varies")
+    assert "varies" in capsys.readouterr().err
+    assert default_scale(tmp_path / "missing.json") == (None, None)
+
+
+def test_summary_records_scale_conclusion():
+    m = _bar(60, 500, 20, 30, 20, 420)
+    te = ThicknessErrors()
+    te.add(m, m.astype(np.float32), 0.5)
+    assert te.summary(mm_per_px=10.0, scale_conclusion="user-supplied")["scale_conclusion"] == "user-supplied"
+    assert te.summary(mm_per_px=10.0)["scale_conclusion"] is None
+
+
+def test_method_mentions_border_cut_walls():
+    assert "tile border" in THICKNESS_METHOD and "biases the thickness low" in THICKNESS_METHOD

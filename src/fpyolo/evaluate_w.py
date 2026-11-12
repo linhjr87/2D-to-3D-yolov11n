@@ -29,7 +29,9 @@ from fpyolo.evaluate_d import (
     CONF, IMGSZ, IOU, MAX_DET, iter_predict, label_path, read_label_rows, split_images,
     ultralytics_val, val_summary, write_json,
 )
-from fpyolo.train import REPO, apply_device_env
+from fpyolo.evaluate_d import check_weights
+from fpyolo.schema import load_schema
+from fpyolo.train import REPO, SCHEMA_PATH, apply_device_env
 
 THRESHOLDS = np.round(np.arange(1, 20) * 0.05, 2)  # 0.05 ... 0.95
 _SUBPIXEL = 4  # cv2.fillPoly fractional bits: vertices kept to 1/16 px
@@ -37,7 +39,9 @@ _CHUNK = 16  # instances per vectorized max in max_score_map
 SCALE_JSON = REPO / "reports" / "scale.json"
 THICKNESS_METHOD = ("2*area/perimeter of the class-agnostic mask; area = pixel count, perimeter = total "
                     "cv2.arcLength of all external and hole contours (RETR_CCOMP, pixel-centre contours); "
-                    "exact for an infinitely long straight bar, a few percent low for a finite one")
+                    "exact for an infinitely long straight bar, a few percent low for a finite one; a wall cut by the "
+                    "tile border counts as a bar end (the border edge adds to the perimeter), which biases the "
+                    "thickness low for both the label and the prediction")
 
 
 def gt_union_mask(label_path: Path, w: int, h: int, cls: int | None = None) -> np.ndarray:
@@ -103,7 +107,9 @@ class ThicknessErrors:
         if gt_t is not None and pred_t is not None:
             self.diffs.append(pred_t - gt_t)
 
-    def summary(self, mm_per_px: float | None) -> dict:
+    def summary(self, mm_per_px: float | None, scale_conclusion: str | None = None) -> dict:
+        """scale_conclusion: where mm_per_px comes from ("constant", "varies", ... of scale.json,
+        or "user-supplied")."""
         d = np.asarray(self.diffs, dtype=float)
         nan = math.nan
         if mm_per_px is None or not len(d):
@@ -112,19 +118,24 @@ class ThicknessErrors:
             e = d * mm_per_px
             mae, med, bias = float(np.abs(e).mean()), float(np.median(np.abs(e))), float(e.mean())
         return {"mae": mae, "median_abs": med, "bias": bias, "n_images": len(d),
-                "mm_per_px": mm_per_px, "method": THICKNESS_METHOD}
+                "mm_per_px": mm_per_px, "scale_conclusion": scale_conclusion, "method": THICKNESS_METHOD}
 
 
-def default_mm_per_px(path: Path = SCALE_JSON) -> float | None:
-    """`overall_median` of reports/scale.json (None if the file is missing). The scale is only a
-    constant mm/px when its conclusion says so; otherwise a warning is printed."""
+def default_scale(path: Path = SCALE_JSON) -> tuple[float | None, str | None]:
+    """(`overall_median`, `conclusion`) of reports/scale.json; (None, None) if the file is missing.
+    The scale is only a constant mm/px when its conclusion says so; otherwise a warning is printed."""
     path = Path(path)
     if not path.is_file():
-        return None
+        return None, None
     doc = json.loads(path.read_text(encoding="utf-8"))
     if doc.get("conclusion") != "constant":
         print(f"warning: {path} concludes {doc.get('conclusion')!r}, not a constant mm/px", file=sys.stderr)
-    return float(doc["overall_median"])
+    return float(doc["overall_median"]), doc.get("conclusion")
+
+
+def default_mm_per_px(path: Path = SCALE_JSON) -> float | None:
+    """`overall_median` of reports/scale.json (None if the file is missing)."""
+    return default_scale(path)[0]
 
 
 class PixelCounts:
@@ -184,8 +195,11 @@ def predict_stream(weights: Path, images: Sequence[Path], *, device: str) -> Ite
 
 
 def evaluate(weights: Path, dataset: Path, out: Path, device: str, limit: int | None = None,
-             mm_per_px: float | None = None) -> dict:
+             mm_per_px: float | None = None, scale_conclusion: str | None = None,
+             schema_path: Path = SCHEMA_PATH) -> dict:
     weights, dataset, out = (Path(p).resolve() for p in (weights, dataset, out))
+    schema_path = Path(schema_path).resolve()
+    check_weights(weights, load_schema(schema_path), "W")
     names = {int(k): v for k, v in
              yaml.safe_load((dataset / "data.yaml").read_text(encoding="utf-8"))["names"].items()}
     out.mkdir(parents=True, exist_ok=True)
@@ -220,11 +234,11 @@ def evaluate(weights: Path, dataset: Path, out: Path, device: str, limit: int | 
         "mask_map_note": ultra["note"],
         "per_class_pixel_iou": {names[c]: float(test[c].iou()[0]) if test[c].n_gt else None
                                 for c in sorted(names)},
-        "wall_thickness_mm": thickness.summary(mm_per_px),
+        "wall_thickness_mm": thickness.summary(mm_per_px, scale_conclusion),
         "thresholds": THRESHOLDS,
         "val_iou_curve": val_curve,
-        "weights": str(weights), "dataset": str(dataset), "limit": limit, "device": device,
-        "n_val_images": len(val_imgs), "n_test_images": len(test_imgs),
+        "weights": str(weights), "dataset": str(dataset), "schema": str(schema_path), "limit": limit,
+        "device": device, "n_val_images": len(val_imgs), "n_test_images": len(test_imgs),
         "ultralytics_val": ultra,
     }
     write_json(out / "metrics.json", metrics)
@@ -241,14 +255,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--mm-per-px", type=float,
                     help=f"scale for the wall-thickness error (default: overall_median of {SCALE_JSON.relative_to(REPO)}; "
                          "null in metrics.json if that file is missing)")
+    ap.add_argument("--schema", type=Path, default=SCHEMA_PATH)
     args = ap.parse_args(argv)
     if args.limit is not None and args.limit < 1:
         ap.error("--limit must be >= 1")
+    if args.limit is not None and args.device != "cpu":
+        ap.error("--limit is for CPU smoke runs only: use --device cpu")
     if args.mm_per_px is not None and not args.mm_per_px > 0:
         ap.error("--mm-per-px must be > 0")
-    mm_per_px = args.mm_per_px if args.mm_per_px is not None else default_mm_per_px()
+    if args.mm_per_px is not None:
+        mm_per_px, conclusion = args.mm_per_px, "user-supplied"
+    else:
+        mm_per_px, conclusion = default_scale()
     apply_device_env(args.device)
-    m = evaluate(args.weights, args.dataset, args.out, args.device, args.limit, mm_per_px)
+    m = evaluate(args.weights, args.dataset, args.out, args.device, args.limit, mm_per_px, conclusion,
+                 args.schema)
     print(f"t* {m['t_star']:.2f}: val IoU {m['val_iou_at_t_star']:.4f}, test IoU {m['test_pixel_iou']:.4f}, "
           f"mask mAP50-95 {m['mask_map50_95']:.4f} -> {Path(args.out) / 'metrics.json'}")
     return 0

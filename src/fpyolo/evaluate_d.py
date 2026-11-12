@@ -102,6 +102,15 @@ def predict_split(weights: Path, images: Sequence[Path], imgsz: int = IMGSZ, con
     return preds
 
 
+def check_weights(weights: Path, schema: Schema, key: str) -> None:
+    """Load `weights` and fail unless its class names are the schema's `key` classes, in order."""
+    from ultralytics import YOLO
+
+    from fpyolo.predict import check_model_names  # fpyolo.predict imports this module
+
+    check_model_names(YOLO(str(weights)), schema, key, weights)
+
+
 def write_preds(path: Path, preds: Mapping[str, Pred]) -> None:
     """Save predictions so that `read_preds` returns the same arrays (values and dtypes)."""
     ids = sorted(preds)
@@ -247,6 +256,7 @@ def evaluate(weights: Path, dataset: Path, split: str, manifest: Path, out: Path
     data_names = yaml.safe_load((dataset / "data.yaml").read_text(encoding="utf-8"))["names"]
     if {int(k): v for k, v in data_names.items()} != names:
         raise ValueError(f"{dataset / 'data.yaml'} class names differ from the D classes of {schema_path}")
+    check_weights(weights, schema, "D")
     all_classes = sorted(names)
     core = core_indices(manifest, schema)
     out.mkdir(parents=True, exist_ok=True)
@@ -295,6 +305,8 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.limit is not None and args.limit < 1:
         ap.error("--limit must be >= 1")
+    if args.limit is not None and args.device != "cpu":
+        ap.error("--limit is for CPU smoke runs only: use --device cpu")
     apply_device_env(args.device)
     m = evaluate(args.weights, args.dataset, args.split, args.manifest, args.out, args.device,
                  args.schema, args.limit)

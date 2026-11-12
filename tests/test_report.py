@@ -33,7 +33,7 @@ def _d_metrics(headline, jitter=0.0, **extra):
          "by_size": {"small": 0.3 + jitter, "medium": 0.5 + jitter, "large": 0.7 + jitter},
          "missing_classes": [f"5_{ABSENT}"], "core_reduced": False, "limit": None, "split": "test",
          "ultralytics_val": {"speed_ms": {"preprocess": 1.0, "inference": 4.0, "postprocess": 2.0},
-                             "device_name": "GPU X"}}
+                             "precision": headline + 0.1, "recall": headline - 0.1, "device_name": "GPU X"}}
     m.update(extra)
     return m
 
@@ -42,7 +42,8 @@ def _w_metrics(iou, **extra):
     m = {"t_star": 0.35, "val_iou_at_t_star": iou - 0.01, "test_pixel_iou": iou, "mask_map50_95": 0.4 + iou / 10,
          "mask_map50": 0.7, "per_class_pixel_iou": {"wall": iou, "curtain_wall": 0.5, "railing": None},
          "limit": None, "wall_thickness_mm": {"mae": 20.0 + iou, "median_abs": 15.0, "bias": -2.0,
-                                              "n_images": 2000, "mm_per_px": 10.0, "method": "2*area/perimeter"}}
+                                              "n_images": 2000, "mm_per_px": 10.0, "scale_conclusion": "constant",
+                                              "method": "2*area/perimeter"}}
     m.update(extra)
     return m
 
@@ -120,6 +121,38 @@ def test_compare_result_is_reported(tree):
     assert "real" in text.lower() and "yes" in text
 
 
+def test_precision_recall_from_ultralytics_val(tree):
+    results, man = tree
+    for s, v in enumerate((0.608, 0.612, 0.616)):
+        _write(results, f"d11n_s{s}", _d_metrics(v))
+    text = build_report(results, man)
+    assert "Precision (Ultralytics averaging)" in text and "Recall (Ultralytics averaging)" in text
+    row = next(line for line in text.splitlines() if line.startswith("| YOLO11n |"))
+    assert "0.712 ± 0.004" in row and "0.512 ± 0.004" in row  # precision, recall
+    assert "| YOLOv8n | 0/3 |" in text and "missing" in text
+
+
+@pytest.mark.parametrize("side,runs", [("a", ["d11n_s0", "d11n_s1"]), ("b", ["d8n_s0", "d8n_s1", "d8n_s9"]),
+                                       ("a", ["d8n_s0", "d8n_s1", "d8n_s2"])])
+def test_compare_runs_must_match_loaded_runs(tree, side, runs):
+    results, man = tree
+    _full(results)
+    c = json.loads((results / "compare.json").read_text())
+    c[side]["runs"] = [str(Path("/elsewhere") / r) for r in runs]
+    (results / "compare.json").write_text(json.dumps(c))
+    with pytest.raises(ReportError, match=f"side {side.upper()}"):
+        build_report(results, man)
+
+
+def test_compare_runs_match_by_basename(tree):
+    results, man = tree
+    _full(results)
+    c = json.loads((results / "compare.json").read_text())
+    c["a"]["runs"] = [f"/other/machine/results/d11n_s{s}" for s in (2, 0, 1)]  # other root, other order
+    (results / "compare.json").write_text(json.dumps(c))
+    assert "+0.042" in build_report(results, man)
+
+
 def test_compare_not_real_says_no(tree):
     results, man = tree
     _full(results)
@@ -178,6 +211,17 @@ def test_w_table_and_thickness(tree):
     assert "wall-thickness" in text.lower() and "mm" in text
     assert "20.8 ± 0.0" in text or "20.8" in text
     assert "n/a" in text                     # railing has no test pixels
+    assert "10 mm/px (constant)." in text
+
+
+def test_w_scale_conclusion_is_printed(tree):
+    results, man = tree
+    m = _w_metrics(0.8)
+    m["wall_thickness_mm"]["scale_conclusion"] = "user-supplied"
+    m["wall_thickness_mm"]["mm_per_px"] = 12.5
+    _write(results, "w11n_s0", m)
+    text = build_report(results, man)
+    assert "12.5 mm/px (user-supplied)." in text and "(constant)" not in text
 
 
 def test_w_without_thickness_key_still_renders(tree):
