@@ -284,9 +284,13 @@ Core = ≥ 50 train and ≥ 15 test instances (`core_classes.json`, written befo
 | 28 | 30 | stairs | vertical-circulation | D / 27 | 2,985 | 348 | 850 | yes |
 | 29 | 31 | elevator | vertical-circulation | D / 28 | 2,070 | 333 | 589 | yes |
 | 30 | 32 | escalator | vertical-circulation | D / 29 | 217 | 37 | 87 | yes |
-| 31 | 1 | wall | wall | W / 0 | 8,170 tiles | 1,145 tiles | 2,333 tiles | – |
+| 31 | 1 | wall | wall | W / 0 | 8,170 tiles¹ | 1,145 tiles¹ | 2,333 tiles¹ | – |
 | 32 | 2 | curtain_wall | wall | W / 1 | 1,843 kept tiles (all sets) | | | – |
 | 33 | 33 | railing | wall | W / 2 | 2,376 kept tiles (all sets) | | | – |
+
+¹ Kept tiles with wall (ID 1) strokes, counted **before** the W coverage exclusion. They are not the W dataset
+sizes: W train has 8,442 images = the train tiles that pass the coverage rule (or have no W-class strokes at
+all), so it includes wall-free negatives and leaves out the 899 low-coverage train tiles (§2.4).
 
 Notes:
 - The release order is SymPoint's thing order shifted by 2, **except** IDs 20–23 (refrigerator, airconditioner,
@@ -475,6 +479,9 @@ lines). Decisions already in the spec (§10 there) are not repeated.
   a private Hugging Face dataset repo, `scripts/fetch_dataset.sh`, `scripts/pack_results.sh`), then decided to
   train on this machine after all, each long job in its own tmux session with a log; the handoff path is kept as
   a backup. GPUs: the controller may pick free GPUs itself after checking `nvidia-smi`; the sweep uses GPUs 6 and 7.
+- **Hugging Face dataset clean-up:** after the single tar was uploaded and its size and SHA-256 were verified, the
+  12,751 partial loose files from an earlier upload attempt were deleted from the dataset repo (user-approved).
+  · One verified artefact instead of a half-uploaded folder. · None (the tar holds everything).
 - Provenance note: commit `db77d77` (in-progress Task 12 files) was made and pushed by a separate session, not by
   the implementation workflow; later commits build on it without amending.
 
@@ -535,7 +542,17 @@ lines). Decisions already in the spec (§10 there) are not repeated.
   31+ is missed (all 30 inspected were different buildings).
 - **`manual_merges` format** `[[["A","0012"],["B","0731"]]]`, validated loudly. Used: none.
 
-### 10.6 Evaluation
+### 10.6 Scale measurement
+
+- **mm/px method changed before review (Task 9 fix round 1):** match a dimension text from its **centre**
+  (start anchor + half the estimated text width), ignore segments shorter than 1 viewBox unit, judge each tile by
+  its consistency (share of estimates within ±10% of the tile median, consistent if ≥ 0.5), base the conclusion on
+  consistent tiles only and call it "inconclusive" below 20 consistent tiles; the literal-anchor numbers are kept
+  in `reports/scale.md` for comparison. · The literal rule (match from the start anchor) produced matching noise:
+  only 4 of 40 tiles had a majority estimate and tile medians reached 10,000 mm/px, so its "varies" verdict was not
+  evidence, and spec §6.10 needs a credible value. · Minutes of compute; the literal rule becomes a secondary result.
+
+### 10.7 Evaluation
 
 - **R5/R6/R9 interfaces:** `env_record` records the SHA-256 of `tiles.csv` and the schema version; `metrics.json`
   stores the dataset/split/manifest paths so `compare` can rebuild GT; core-class semantic IDs are mapped to
@@ -574,9 +591,13 @@ lines). Decisions already in the spec (§10 there) are not repeated.
   over all three, not wall alone (per-class IoU is reported separately).
 - **GT masks via `cv2.fillPoly` are ~1 px wider** than the analytic regions (boundary pixels filled).
 - **Wall thickness is an approximation:** image-level 2·area/perimeter over the class-agnostic mask
-  (including curtain walls and railings). For a long straight wall of width w it gives ≈ w; wall ends,
-  short segments and junctions make it read low; truncation of walls at the tile border changes it by < 1%.
-  It is a consistency measure between prediction and label, not a per-wall thickness.
+  (including curtain walls and railings); perimeter = `cv2.arcLength` of all external and hole contours
+  (`evaluate_w.THICKNESS_METHOD`). It is exact for an infinitely long straight bar and a few percent low for a
+  finite one (a bar of width w and length L reads ≈ w·L/(L + w)); short segments and junctions read lower.
+  Walls cut by the tile border count as bar ends, because the border edge is part of the contour: a 20 px wall
+  running the full 1000 px tile reads ~2% low. The same bias applies to the GT and the predicted mask, so it
+  largely cancels in the error. It is a consistency measure between prediction and label, not a per-wall
+  thickness.
 - **3 seeds measure training noise, not split noise.** A different cluster split could move all numbers;
   the bootstrap over test clusters covers test-set sampling only.
 - **Speed measured on an RTX A5000** on a shared machine via Ultralytics' val timings; not an end-to-end
@@ -660,7 +681,7 @@ Boxes: 99,755 in total, 59 padded to 2 px, 8,646 smaller than 32 px, 3,875 tiles
 
 **W coverage and exclusion**
 
-| Split | Tiles with walls | Excluded (coverage < 0.8) | Excluded share |
+| Split | Tiles with W-class strokes | Excluded (coverage < 0.8) | Excluded share |
 |---|---|---|---|
 | train | 8,612 | 899 | 10.4% |
 | val | 1,189 | 128 | 10.8% |
