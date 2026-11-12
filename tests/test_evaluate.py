@@ -207,6 +207,36 @@ def test_predict_one_image_per_call(spaced_tmp, monkeypatch):
     assert all(kw["retina_masks"] is True for _, kw in model.calls)
 
 
+def test_ultralytics_val_trims_heap_and_pins_loader(spaced_tmp, monkeypatch):
+    # glibc keeps freed heap pages: without a trim after each val batch, RSS drifted up
+    # ~6 MB/image on W val (trimmed: flat). batch/workers are explicit to bound host RAM.
+    import ultralytics
+
+    from fpyolo import evaluate_d
+
+    class _Val:
+        def __init__(self):
+            self.callbacks, self.kwargs = {}, None
+
+        def add_callback(self, event, fn):
+            self.callbacks.setdefault(event, []).append(fn)
+
+        def val(self, **kw):
+            self.kwargs = kw
+            for fn in self.callbacks.get("on_val_batch_end", []):
+                fn(None)  # must accept the validator argument
+            return "metrics"
+
+    model = _Val()
+    monkeypatch.setattr(ultralytics, "YOLO", lambda weights: model)
+    out = spaced_tmp / "out"
+    assert evaluate_d.ultralytics_val(Path("w.pt"), spaced_tmp, "test", out, "cpu") == "metrics"
+    assert evaluate_d.trim_heap in model.callbacks["on_val_batch_end"]
+    kw = model.kwargs
+    assert kw["batch"] == 16 and kw["workers"] == 2 and kw["split"] == "test" and kw["imgsz"] == 1024
+    assert kw["project"] == str(spaced_tmp) and kw["name"] == "out" and kw["exist_ok"] is True
+
+
 def _write_run(run_dir, preds, dataset, manifests, split="test"):
     run_dir.mkdir(parents=True)
     write_preds(run_dir / "preds.npz", preds)
@@ -320,3 +350,35 @@ def test_smoke_weights_predict_on_cpu(spaced_tmp):
     assert r["path"] == str(img) and r["orig_shape"] == [999, 1000]
     assert r["map_shape"] == [999, 1000] and r["map_dtype"] == "float32"
     assert 0 <= r["min"] <= r["max"] <= 1
+
+
+_RSS_SCRIPT = """
+import json, resource, shutil, sys
+from pathlib import Path
+from fpyolo.evaluate_d import predict_split
+weights, img, k, tmp = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4])
+imgs = []
+for i in range(k):
+    imgs.append(tmp / f"test-00_{i:04d}-0000.png")
+    shutil.copy(img, imgs[-1])
+predict_split(weights, imgs, device="cpu")
+print(json.dumps({"maxrss_mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024}))
+"""
+
+
+@pytest.mark.skipif(os.environ.get("FPYOLO_MEMCHECK") != "1" or not SMOKE_D.is_file(),
+                    reason="opt-in (FPYOLO_MEMCHECK=1), needs the Task 11 smoke weights")
+def test_predict_peak_rss_does_not_grow_with_images(spaced_tmp):
+    # The one-batch-per-list bug added ~57 MB of peak RSS per listed image on CPU.
+    rgb = np.full((1000, 1000, 3), 255, np.uint8)
+    rgb[100:900:50, 50:950] = 0
+    Image.fromarray(rgb).save(spaced_tmp / "src.png")
+    peaks = []
+    for k in (2, 24):
+        tmp = spaced_tmp / f"k{k}"
+        tmp.mkdir()
+        proc = subprocess.run([sys.executable, "-c", _RSS_SCRIPT, str(SMOKE_D), str(spaced_tmp / "src.png"),
+                               str(k), str(tmp)], env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+                              capture_output=True, text=True, check=True)
+        peaks.append(json.loads(proc.stdout.strip().splitlines()[-1])["maxrss_mib"])
+    assert peaks[1] - peaks[0] < 300, peaks

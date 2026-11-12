@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
 import json
 import math
 import shutil
@@ -30,6 +31,9 @@ from fpyolo.train import SCHEMA_PATH, apply_device_env
 IMG_SUFFIXES = {".png", ".jpg", ".jpeg"}
 # Prediction settings shared by every evaluation (global constraints).
 IMGSZ, CONF, IOU, MAX_DET = 1024, 0.001, 0.7, 300
+# Ultralytics val loader, explicit to bound host RAM: on a GPU Ultralytics would otherwise start
+# up to 8 persistent worker processes, each prefetching 2 batches (on CPU it forces 0 workers).
+VAL_BATCH, VAL_WORKERS = 16, 2
 ULTRA_NOTE = ("Ultralytics' own averaging: mean over the classes that have labels in this split "
               "(absent classes are dropped); not the fixed class sets used above")
 
@@ -183,9 +187,31 @@ def ultralytics_val(weights: Path, dataset: Path, split: str, out: Path, device:
     data = dataset / "data.yaml"
     if images is not None:
         data = _subset_data_yaml(dataset, split, images, out / "val_subset")
-    return YOLO(str(weights)).val(data=str(data), split=split, imgsz=IMGSZ, conf=CONF, iou=IOU,
-                                  max_det=MAX_DET, device=device, plots=True,
-                                  project=str(out.parent), name=out.name, exist_ok=True)
+    model = YOLO(str(weights))
+    model.add_callback("on_val_batch_end", trim_heap)
+    return model.val(data=str(data), split=split, imgsz=IMGSZ, conf=CONF, iou=IOU, max_det=MAX_DET,
+                     batch=VAL_BATCH, workers=VAL_WORKERS, device=device, plots=True,
+                     project=str(out.parent), name=out.name, exist_ok=True)
+
+
+def _libc_malloc_trim():
+    try:
+        return ctypes.CDLL("libc.so.6").malloc_trim
+    except (OSError, AttributeError):  # not glibc
+        return None
+
+
+_MALLOC_TRIM = _libc_malloc_trim()
+
+
+def trim_heap(*_) -> None:
+    """Give freed heap memory back to the OS (an Ultralytics callback, hence the ignored argument).
+
+    glibc keeps freed pages of the variable-size per-batch buffers, so without this the RSS of
+    W val crept up ~6 MB per image (measured flat with a trim after every batch).
+    """
+    if _MALLOC_TRIM is not None:
+        _MALLOC_TRIM(0)
 
 
 def val_summary(m, device: str) -> dict:
@@ -199,7 +225,7 @@ def val_summary(m, device: str) -> dict:
     return {"note": ULTRA_NOTE, "box_map50_95": m.box.map, "box_map50": m.box.map50,
             "precision": m.box.mp, "recall": m.box.mr,
             "speed_ms": {k: m.speed[k] for k in ("preprocess", "inference", "postprocess")},
-            "device_name": device_name}
+            "batch": VAL_BATCH, "device_name": device_name}
 
 
 def _write_per_class(path: Path, per_class: Mapping[str, dict]) -> None:
