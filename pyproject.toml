@@ -8,9 +8,9 @@ version = "0.1.0"
 description = "FloorPlanCAD to Ultralytics YOLO datasets and YOLO11n training"
 requires-python = ">=3.12"
 dependencies = [
-    "ultralytics>=8.3,<9",
+    "ultralytics>=8.4.210,<8.5",
     "svgelements",
-    "shapely>=2.0",
+    "shapely>=2.1",
     "numpy",
     "pillow",
     "pyyaml",
