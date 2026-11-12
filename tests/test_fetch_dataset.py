@@ -11,7 +11,7 @@ import yaml
 from conftest import REPO
 
 
-def _fake_tar(root: Path) -> Path:
+def _fake_tar(root: Path, tiles: bool = True) -> Path:
     src = root / "src"
     (src / "fpcad_v0" / "D" / "images").mkdir(parents=True)
     (src / "fpcad_v0" / "W" / "images").mkdir(parents=True)
@@ -20,7 +20,9 @@ def _fake_tar(root: Path) -> Path:
     os.link(src / "fpcad_v0" / "D" / "images" / "a.png", src / "fpcad_v0" / "W" / "images" / "a.png")
     (src / "fpcad_v0" / "D" / "data.yaml").write_text("path: /old/D\ntrain: images\n")
     (src / "fpcad_v0" / "W" / "data.yaml").write_text("path: /old/W\ntrain: images\n")
-    (src / "fpcad_v0" / "manifests" / "tiles.csv").write_text("id,split\n1,train\n")
+    (src / "fpcad_v0" / "manifests" / "stats.json").write_text("{}")
+    if tiles:
+        (src / "fpcad_v0" / "manifests" / "tiles.csv").write_text("id,split\n1,train\n")
     hf = root / "hf"
     hf.mkdir()
     subprocess.run(["tar", "-cf", str(hf / "fpcad_v0.tar"), "-C", str(src), "fpcad_v0"], check=True)
@@ -72,6 +74,13 @@ def test_fetch_rejects_bad_checksum(checkout, spaced_tmp):
 def test_fetch_rejects_manifest_differing_from_committed(checkout, spaced_tmp):
     hf = _fake_tar(spaced_tmp)
     (checkout / "data" / "fpcad_v0" / "manifests" / "tiles.csv").write_text("other\n")
+    out = _fetch(checkout, hf)
+    assert out.returncode == 1 and "tiles.csv" in out.stderr
+    assert not (checkout / "data" / "fpcad_v0" / "D").exists()
+
+
+def test_fetch_requires_tiles_csv_in_the_archive(checkout, spaced_tmp):
+    hf = _fake_tar(spaced_tmp, tiles=False)
     out = _fetch(checkout, hf)
     assert out.returncode == 1 and "tiles.csv" in out.stderr
     assert not (checkout / "data" / "fpcad_v0" / "D").exists()

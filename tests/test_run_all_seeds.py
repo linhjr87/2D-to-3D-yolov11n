@@ -13,13 +13,26 @@ from conftest import REPO
 SCRIPT = REPO / "scripts" / "run_all_seeds.sh"
 
 STUB = """#!/usr/bin/env bash
-# stands in for `python`: only the `-m fpyolo.train|runstate` calls the script makes
+# stands in for `python`: only the `-m fpyolo.train|runstate` calls the script makes.
+# A run dir holding a marker file ".running" / ".partial" reports that state, any other dir is done.
 trace="$STUB_TRACE"
 case "$2" in
 fpyolo.runstate)
     case "$3" in
-    state) [ -d "$4" ] && echo done || echo absent ;;
-    verify) echo "ok $(basename "$4")" ;;
+    state)
+        echo "import noise on stdout"
+        if [ -f "$4/.running" ]; then echo running
+        elif [ -f "$4/.partial" ]; then echo partial
+        elif [ -d "$4" ]; then echo done
+        else echo absent; fi ;;
+    resume)
+        echo "resume $(basename "$4") $6 x $(date +%s%N)" >> "$trace"
+        rm -f "$4/.partial" ;;
+    verify)
+        echo "verify $(basename "$4") - $* $(date +%s%N)" >> "$trace"
+        case " $* " in *" --log "*) ;; *) echo "verify without --log" >&2; exit 9 ;; esac
+        if [ "$(basename "$4")" = "${STUB_VERIFY_FAIL:-}" ]; then echo "PROBLEM $(basename "$4"): x"; exit 1; fi
+        echo "ok $(basename "$4")" ;;
     *) echo "unexpected runstate call: $*" >&2; exit 9 ;;
     esac ;;
 fpyolo.train)
@@ -58,8 +71,9 @@ def _run(env, **kw):
 
 
 def _events(tmp_path):
+    """(kind, name, device, batch, nanoseconds) rows of the stub trace; kind is start/end/resume/verify."""
     rows = [line.split() for line in (tmp_path / "trace").read_text().splitlines()]
-    return [(kind, name, dev, batch, int(t)) for kind, name, dev, batch, t in rows]
+    return [(r[0], r[1], r[2], r[3], int(r[-1])) for r in rows]
 
 
 def test_gpus_required(tmp_path):
@@ -69,7 +83,7 @@ def test_gpus_required(tmp_path):
     assert not (tmp_path / "trace").exists()
 
 
-@pytest.mark.parametrize("gpus", ["0,1", "a", "1 1"])
+@pytest.mark.parametrize("gpus", ["0,1", "a", "1 1", "   "])
 def test_bad_gpus_rejected(tmp_path, gpus):
     out = _run(_env(tmp_path, GPUS=gpus))
     assert out.returncode == 1 and "GPU" in out.stderr
@@ -85,6 +99,7 @@ def test_queue_runs_each_job_once_one_per_gpu(tmp_path):
     out = _run(_env(tmp_path, GPUS="3 5", BATCH_D="24"))
     assert out.returncode == 0, out.stderr
     ev = _events(tmp_path)
+    ev = [e for e in ev if e[0] in ("start", "end")]
     starts = [e for e in ev if e[0] == "start"]
     assert sorted(e[1] for e in starts) == sorted(
         f"{k}_s{s}" for k in ("d11n", "d8n", "w11n") for s in (0, 1, 2))
@@ -100,11 +115,70 @@ def test_queue_runs_each_job_once_one_per_gpu(tmp_path):
         live += 1 if e[0] == "start" else -1
         peak = max(peak, live)
     assert peak == 2
-    # second invocation: everything is done, nothing starts
+    # every finished run was verified once
+    assert sorted(e[1] for e in _events(tmp_path) if e[0] == "verify") == sorted(e[1] for e in starts)
+    # second invocation: everything is done, nothing starts, but every run is verified again
     (tmp_path / "trace").unlink()
     again = _run(_env(tmp_path, GPUS="3 5"))
     assert again.returncode == 0 and "skipping" in again.stdout
+    kinds = [e[0] for e in _events(tmp_path)]
+    assert kinds == ["verify"] * 9
+
+
+def test_verify_failure_of_a_done_run_fails_the_sweep(tmp_path):
+    (tmp_path / "runs" / "d11n_s0").mkdir(parents=True)  # done already
+    out = _run(_env(tmp_path, GPUS="0", STUB_VERIFY_FAIL="d11n_s0"))
+    assert out.returncode == 1 and "FAILED runs: d11n_s0" in out.stderr
+    assert "PROBLEM d11n_s0" in (tmp_path / "runs" / "d11n_s0.log").read_text()  # also kept in the log
+
+
+def test_partial_run_is_resumed_then_verified(tmp_path):
+    run = tmp_path / "runs" / "d8n_s0"
+    run.mkdir(parents=True)
+    (run / ".partial").write_text("")
+    out = _run(_env(tmp_path, GPUS="2"))
+    assert out.returncode == 0, out.stderr
+    mine = [e for e in _events(tmp_path) if e[1] == "d8n_s0"]
+    assert [e[0] for e in mine] == ["resume", "verify"]  # resumed (no fresh start), then checked
+    assert mine[0][2] == "2" and mine[0][4] < mine[1][4]
+    assert sum(1 for e in _events(tmp_path) if e[0] == "start") == 8
+
+
+def test_running_run_is_skipped_with_a_warning(tmp_path):
+    run = tmp_path / "runs" / "w11n_s1"
+    run.mkdir(parents=True)
+    (run / ".running").write_text("")
+    out = _run(_env(tmp_path, GPUS="0"))
+    assert out.returncode == 0
+    assert "WARNING" in out.stderr and "w11n_s1" in out.stderr
+    names = [e[1] for e in _events(tmp_path)]
+    assert "w11n_s1" not in names and len([e for e in _events(tmp_path) if e[0] == "start"]) == 8
+
+
+HOLD_SWEEP_LOCK = """
+import fcntl, sys, time
+f = open(sys.argv[1], "a")
+fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+print("locked", flush=True)
+time.sleep(60)
+"""
+
+
+def test_second_sweep_on_the_same_runs_dir_refuses(tmp_path):
+    env = _env(tmp_path, GPUS="0")
+    (tmp_path / "runs").mkdir()
+    holder = subprocess.Popen([sys.executable, "-c", HOLD_SWEEP_LOCK, str(tmp_path / "runs" / ".sweep.lock")],
+                              stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        out = _run(env)
+    finally:
+        holder.kill()
+        holder.wait()
+    assert out.returncode == 1 and "another sweep is running" in out.stderr
     assert not (tmp_path / "trace").exists()
+    # once the holder is gone the lock is free again
+    assert _run(_env(tmp_path, GPUS="0", STUB_SLEEP="0")).returncode == 0
 
 
 def test_failed_run_is_reported_but_queue_continues(tmp_path):

@@ -12,16 +12,18 @@ from fpyolo import runstate
 from fpyolo.runstate import (
     next_env_resume_path, pci_problems, resume_run, run_state, verify_run,
 )
+from fpyolo.train import LOCK_NAME, RunLocked, acquire_run_lock
 
 
-def _ckpt(path, *, finished, data="/x/D/data.yaml"):
+def _ckpt(path, *, finished, data="/x/D/data.yaml", batch=32, epoch=None, epochs=None):
     """Tiny stand-in for what Ultralytics writes: save_model (epoch >= 0 + optimizer) or strip_optimizer."""
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "epoch": -1 if finished else 7,
+            "epoch": -1 if finished else (7 if epoch is None else epoch),
             "optimizer": None if finished else {"state": {}, "param_groups": []},
-            "train_args": {"data": data, "batch": 32, "optimizer": "SGD"},
+            "train_args": {"data": data, "batch": batch, "optimizer": "SGD",
+                           **({"epochs": epochs} if epochs is not None else {})},
         },
         path,
     )
@@ -88,6 +90,106 @@ def test_state_cli(tmp_path):
     assert out.stdout.strip() == "done"
 
 
+HOLDER = """
+import fcntl, sys, time
+f = open(sys.argv[1], "a")
+fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+print("locked", flush=True)
+time.sleep(60)
+"""
+
+
+@pytest.fixture
+def lock_holder():
+    """Start a subprocess that holds the flock on a given lock file; killed at teardown."""
+    procs = []
+
+    def start(lock_path):
+        proc = subprocess.Popen([sys.executable, "-c", HOLDER, str(lock_path)], stdout=subprocess.PIPE, text=True)
+        procs.append(proc)
+        assert proc.stdout.readline().strip() == "locked"
+        return proc
+
+    yield start
+    for proc in procs:
+        proc.kill()
+        proc.wait()
+
+
+def test_state_running_while_locked_then_partial(tmp_path, lock_holder):
+    run = _run(tmp_path, "r", last="running", best=True)
+    assert run_state(run) == "partial"
+    holder = lock_holder(run / LOCK_NAME)
+    assert run_state(run) == "running"
+    out = subprocess.run([sys.executable, "-m", "fpyolo.runstate", "state", str(run)],
+                         capture_output=True, text=True, check=True)
+    assert out.stdout.strip().splitlines()[-1] == "running"
+    holder.kill()
+    holder.wait()
+    assert run_state(run) == "partial"  # the kernel drops the lock with the process
+
+
+def test_state_does_not_create_a_lock_file(tmp_path):
+    run = _run(tmp_path, "r", last="finished", best=True)
+    run_state(run)
+    assert not (run / LOCK_NAME).exists()
+
+
+def test_resume_refuses_locked_run(tmp_path, lock_holder):
+    run = _run(tmp_path, "r", last="running", best=True)
+    lock_holder(run / LOCK_NAME)
+    _FakeYOLO.calls = []
+    with pytest.raises(SystemExit, match="locked"):
+        resume_run(run, "cpu", yolo_cls=_FakeYOLO)
+    assert _FakeYOLO.calls == [] and not list(run.glob("env_resume_*.json"))
+
+
+def test_resume_cli_refuses_locked_run(tmp_path, lock_holder):
+    run = _run(tmp_path, "r", last="running", best=True)
+    lock_holder(run / LOCK_NAME)
+    out = subprocess.run([sys.executable, "-m", "fpyolo.runstate", "resume", str(run), "--device", "cpu"],
+                         capture_output=True, text=True)
+    assert out.returncode != 0 and "locked" in out.stderr
+
+
+def test_resume_holds_the_lock_while_training(tmp_path, monkeypatch):
+    run = _run(tmp_path, "r", last="running", best=True)
+    monkeypatch.setattr(runstate, "env_record", lambda d, y=None: {"device": d})
+
+    class Probe:
+        def __init__(self, weights):
+            pass
+
+        def train(self, **kw):
+            with pytest.raises(RunLocked):  # a second locker is refused while train() runs
+                acquire_run_lock(run)
+
+    resume_run(run, "cpu", yolo_cls=Probe)
+
+
+def test_resume_refuses_run_that_reached_its_last_epoch(tmp_path):
+    run = tmp_path / "r"
+    _ckpt(run / "weights" / "last.pt", finished=False, epoch=299, epochs=300)
+    _ckpt(run / "weights" / "best.pt", finished=True)
+    assert run_state(run) == "partial"
+    _FakeYOLO.calls = []
+    with pytest.raises(SystemExit) as e:
+        resume_run(run, "cpu", yolo_cls=_FakeYOLO)
+    msg = str(e.value)
+    assert "Do NOT delete" in msg and "strip_optimizer" in msg and str(run) in msg
+    assert _FakeYOLO.calls == []
+
+
+def test_resume_allows_run_before_its_last_epoch(tmp_path, monkeypatch):
+    run = tmp_path / "r"
+    _ckpt(run / "weights" / "last.pt", finished=False, epoch=298, epochs=300)
+    _ckpt(run / "weights" / "best.pt", finished=True)
+    monkeypatch.setattr(runstate, "env_record", lambda d, y=None: {"device": d})
+    _FakeYOLO.calls = []
+    resume_run(run, "cpu", yolo_cls=_FakeYOLO)
+    assert len(_FakeYOLO.calls) == 1
+
+
 def test_next_env_resume_path(tmp_path):
     assert next_env_resume_path(tmp_path).name == "env_resume_1.json"
     (tmp_path / "env_resume_1.json").write_text("{}")
@@ -142,12 +244,16 @@ def test_resume_cli_requires_device(tmp_path):
 
 # ---- verify ----
 
-def _good_run(tmp_path, *, batch=32, optimizer="SGD", device="1", bus="00000000:3B:00.0"):
+def _good_run(tmp_path, *, batch=32, optimizer="SGD", device="1", bus="00000000:3B:00.0", args_batch=32):
+    """A run dir like Ultralytics leaves it: args.yaml is written once with the REQUESTED batch,
+    the checkpoints carry the effective batch in train_args (they differ after an OOM halving)."""
     run = tmp_path / "r"
     run.mkdir()
-    (run / "args.yaml").write_text(yaml.safe_dump({"optimizer": optimizer, "batch": batch}))
+    (run / "args.yaml").write_text(yaml.safe_dump({"optimizer": optimizer, "batch": args_batch}))
     (run / "env.json").write_text(json.dumps(
         {"device": device, "gpu": {"index": int(device), "pci_bus_id": bus}}))
+    _ckpt(run / "weights" / "last.pt", finished=True, batch=batch)
+    _ckpt(run / "weights" / "best.pt", finished=True, batch=batch)
     return run
 
 
@@ -167,9 +273,29 @@ def test_verify_ok(tmp_path):
     assert verify_run(_good_run(tmp_path), expected_batch=32, smi_csv=SMI) == []
 
 
-def test_verify_batch_halved(tmp_path):
-    problems = verify_run(_good_run(tmp_path, batch=16), expected_batch=32, smi_csv=SMI)
-    assert len(problems) == 1 and "batch" in problems[0] and "16" in problems[0]
+def test_verify_batch_halved_in_checkpoint_although_args_yaml_says_32(tmp_path):
+    run = _good_run(tmp_path, batch=16, args_batch=32)
+    problems = verify_run(run, expected_batch=32, smi_csv=SMI)
+    assert len(problems) == 1 and "effective batch" in problems[0] and "16" in problems[0]
+
+
+def test_verify_falls_back_to_best_pt(tmp_path):
+    run = _good_run(tmp_path, batch=16)
+    (run / "weights" / "last.pt").unlink()
+    assert any("16" in p for p in verify_run(run, expected_batch=32, smi_csv=SMI))
+    (run / "weights" / "best.pt").unlink()
+    assert any("no readable checkpoint" in p for p in verify_run(run, expected_batch=32, smi_csv=SMI))
+
+
+def test_verify_log_with_reducing_to_batch(tmp_path):
+    run = _good_run(tmp_path)
+    log = tmp_path / "r.log"
+    log.write_text("epoch 1\nWARNING CUDA out of memory with batch=32. Reducing to batch=16 and retrying (1/3).\n")
+    problems = verify_run(run, expected_batch=32, smi_csv=SMI, log_path=log)
+    assert len(problems) == 1 and "Reducing to batch" in problems[0]
+    log.write_text("epoch 1\n")
+    assert verify_run(run, expected_batch=32, smi_csv=SMI, log_path=log) == []
+    assert verify_run(run, expected_batch=32, smi_csv=SMI, log_path=tmp_path / "missing.log") == []
 
 
 def test_verify_optimizer_not_sgd(tmp_path):
@@ -182,6 +308,7 @@ def test_verify_missing_files_and_pci_mismatch(tmp_path):
     run.mkdir()
     problems = verify_run(run, expected_batch=32, smi_csv=None)
     assert any("args.yaml" in p for p in problems) and any("env.json" in p for p in problems)
+    assert any("no readable checkpoint" in p for p in problems)
     other = tmp_path / "other"
     other.mkdir()
     wrong = _good_run(other, bus="00000000:99:00.0")
@@ -205,3 +332,8 @@ def test_verify_cli_expected_batch_from_config(tmp_path):
     bad = subprocess.run([sys.executable, "-m", "fpyolo.runstate", "verify", str(run), "--config", str(cfg),
                           "--batch", "16", "--no-nvidia-smi"], capture_output=True, text=True)
     assert bad.returncode == 1 and "batch" in bad.stdout
+    log = tmp_path / "r.log"
+    log.write_text("Reducing to batch=16\n")
+    logged = subprocess.run([sys.executable, "-m", "fpyolo.runstate", "verify", str(run), "--config", str(cfg),
+                             "--log", str(log), "--no-nvidia-smi"], capture_output=True, text=True)
+    assert logged.returncode == 1 and "Reducing to batch" in logged.stdout

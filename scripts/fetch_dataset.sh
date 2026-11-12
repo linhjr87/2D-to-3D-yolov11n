@@ -51,6 +51,8 @@ for d in D W manifests; do
     [ -d "$TMP/fpcad_v0/$d" ] || die "archive has no fpcad_v0/$d"
 done
 
+[ -f "$TMP/fpcad_v0/manifests/tiles.csv" ] || die "archive has no fpcad_v0/manifests/tiles.csv"
+
 # 4. manifests: the committed copies must be byte-identical to the archive's (split reproducibility)
 for f in "$TMP"/fpcad_v0/manifests/*; do
     name="$(basename "$f")"

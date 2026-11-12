@@ -73,7 +73,7 @@ Long jobs must survive a closed terminal: run them inside `tmux` (or `screen`), 
 
 ## 1-epoch GPU trial (before the sweep)
 
-The sweep uses `batch: 32` from the configs. Check once on one approved GPU that it fits. **Ultralytics does not fail on a GPU out-of-memory error in the first epoch: it halves `batch` (up to 3 times) and carries on.** So the trial passes only if `args.yaml` still says `batch: 32` and the log has no "Reducing to batch" line. Both D configs must use the same batch, so the trial covers all three configs.
+The sweep uses `batch: 32` from the configs. Check once on one approved GPU that it fits. **Ultralytics does not fail on a GPU out-of-memory error in the first epoch: it halves `batch` (up to 3 times) and carries on.** So the trial passes only if the effective batch is still 32: `python -m fpyolo.runstate verify` reads it from the checkpoint (`args.yaml` is written once at the start and does not show the halving) and also looks for the "Reducing to batch" line in the log. Both D configs must use the same batch, so the trial covers all three configs.
 
 ```bash
 GPU=6                       # the approved GPU
@@ -83,8 +83,8 @@ for t in d11n:train_d_yolo11n:D d8n:train_d_yolov8n:D w11n:train_w_yolo11n_seg:W
     sed 's/^epochs: .*/epochs: 1/' "configs/$cfg.yaml" > "runs/trial/$name.yaml"
     python -m fpyolo.train --config "runs/trial/$name.yaml" --data "data/fpcad_v0/$kind/data.yaml" \
         --seed 0 --project runs/trial --name "$name" --device "$GPU" 2>&1 | tee "runs/trial/$name.log"
-    grep -E '^batch:' "runs/trial/$name/args.yaml"
-    grep -c 'Reducing to batch' "runs/trial/$name.log" || true      # must print 0
+    # effective batch from the checkpoint + "Reducing to batch" in the log (the GPU record check is skipped: 1 epoch)
+    python -m fpyolo.runstate verify "runs/trial/$name" --config "configs/$cfg.yaml" --log "runs/trial/$name.log" --no-nvidia-smi
 done
 ```
 
@@ -110,8 +110,9 @@ GPUS="6 7" scripts/run_all_seeds.sh 2>&1 | tee -a runs/sweep.log
 - Optional variables: `BATCH_D`, `BATCH_W` (passed to `fpyolo.train --batch`; `BATCH_D` applies to both D models), `DATA_ROOT` (default `data/fpcad_v0`), `RUNS_DIR` (default `runs`), `PYTHON`.
 - `DRY_RUN=1 GPUS="6 7" scripts/run_all_seeds.sh` prints what each GPU slot would do (start, resume, skip) and runs nothing.
 - Run directories are `runs/<name>/` (for example `runs/d11n_s0/`) and logs are `runs/<name>.log` (appended on resume).
-- Finished runs are skipped, interrupted runs are resumed, so after a crash, a reboot, or an out-of-memory error caused by another user's job you only start the same command again once memory is free. A run directory with nothing to resume from (the run died before saving its first checkpoint) is reported as failed: delete that directory (`rm -rf runs/<name>`), then start the command again.
-- After each run the script runs `python -m fpyolo.runstate verify` and prints `ok <name>` or `PROBLEM <name>: ...`. It checks that `args.yaml` has `optimizer: SGD` and the requested `batch`, and that `env.json` records a GPU whose PCI bus id matches `nvidia-smi`.
+- Finished runs are skipped (and verified again), interrupted runs are resumed, so after a crash, a reboot, or an out-of-memory error caused by another user's job you start the same command again **after the sweep has exited** and memory is free. A run directory with nothing to resume from (the run died before saving its first checkpoint) is reported as failed: delete that directory (`rm -rf runs/<name>`), then start the command again. A run that reached its last epoch but was killed before the final strip is also reported as failed by the resume step; it must not be deleted, see "Resume" below.
+- Only one sweep can run per `runs/` directory (the script holds `runs/.sweep.lock`), and every run holds `runs/<name>/.fpyolo.lock` while it trains. A second sweep exits with an error; a run that another process is training is skipped with a warning, and `python -m fpyolo.runstate state` prints `running` for it. The locks are released by the kernel when a process dies, so a crashed run is simply `partial`.
+- After each run the script runs `python -m fpyolo.runstate verify` and prints `ok <name>` or `PROBLEM <name>: ...`. It checks `optimizer: SGD` in `args.yaml`, that the **effective batch** stored in `weights/last.pt` (`train_args`) equals the requested one and that the log has no "Reducing to batch" line (Ultralytics halves the batch after a first-epoch OOM; `args.yaml` is written once and keeps the requested value), and that `env.json` records a GPU whose PCI bus id matches `nvidia-smi`.
 
 Check progress with `tail -f runs/<name>.log`, `nvidia-smi`, and `runs/<name>/results.csv` (one row per epoch).
 
@@ -123,24 +124,32 @@ The script already does these; repeat them by hand if in doubt:
 
 ```bash
 for r in runs/*_s[012]; do
-    echo "== $r"; grep -E '^(optimizer|batch):' "$r/args.yaml"
+    echo "== $r"; grep -E '^optimizer:' "$r/args.yaml"
+    python -c "import torch; print('effective batch', torch.load('$r/weights/last.pt', weights_only=False)['train_args']['batch'])"
+    grep -c 'Reducing to batch' "$r.log" || true                   # must print 0
     python -c "import json,sys; e=json.load(open('$r/env.json')); print(e['device'], e['gpu']['name'], e['gpu']['pci_bus_id'])"
 done
 nvidia-smi --query-gpu=index,pci.bus_id --format=csv          # bus ids must match
 ```
 
-Every `args.yaml` must show `optimizer: SGD`. All 6 D runs (both models) must show the same `batch`. A `batch` below the requested one means Ultralytics halved it after an out-of-memory error: discard that run and rerun it with a smaller `BATCH_D` for all D runs.
+Every `args.yaml` must show `optimizer: SGD`. All 6 D runs (both models) must show the same effective batch. An effective batch below the requested one (or a "Reducing to batch" line in the log) means Ultralytics halved it after an out-of-memory error; `args.yaml` still shows the requested value. Discard that run and rerun it with a smaller `BATCH_D` for all D runs.
 
 ## Resume
 
 `scripts/run_all_seeds.sh` resumes interrupted runs by itself. To do it for one run by hand:
 
 ```bash
-python -m fpyolo.runstate state  runs/d11n_s0                  # absent | partial | done | broken
+python -m fpyolo.runstate state  runs/d11n_s0                  # absent | running | partial | done | broken
 python -m fpyolo.runstate resume runs/d11n_s0 --device 6       # only for 'partial'
 ```
 
-`resume` records the GPU in `runs/<name>/env_resume_<n>.json` and continues with `YOLO("<run>/weights/last.pt").train(resume=True, device="<idx>")`; Ultralytics restores all other settings from the checkpoint. A finished run's `last.pt` has been stripped of its optimizer state and cannot be resumed (state `done`). A run that finished is never restarted. The same first-epoch out-of-memory halving can happen in a resumed process, so check `batch` again afterwards.
+`resume` records the GPU in `runs/<name>/env_resume_<n>.json` and continues with `YOLO("<run>/weights/last.pt").train(resume=True, device="<idx>")`; Ultralytics restores all other settings from the checkpoint. A finished run's `last.pt` has been stripped of its optimizer state and cannot be resumed (state `done`). A run that finished is never restarted. The same first-epoch out-of-memory halving can happen in a resumed process, so check the effective batch again afterwards (`verify` does).
+
+`resume` refuses a run that another process is training (state `running`, the run's `.fpyolo.lock` is held). It also refuses a run that reached its last epoch but was killed before the final strip (`last.pt` has `epoch == epochs - 1`; Ultralytics cannot resume it). Never delete such a run: all its epochs are done. Strip its checkpoints, which turns it into `done`:
+
+```bash
+python -c "from ultralytics.utils.torch_utils import strip_optimizer as s; [s('runs/<name>/weights/%s.pt' % n) for n in ('last', 'best')]"
+```
 
 ## Evaluation
 

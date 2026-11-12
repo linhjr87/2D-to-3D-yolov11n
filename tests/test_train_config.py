@@ -142,3 +142,27 @@ def test_batch_below_one_rejected(bad, capsys, tmp_path):
     assert e.value.code == 2
     assert "--batch" in capsys.readouterr().err
     assert not (tmp_path / "run").exists()
+
+
+def test_train_main_holds_the_run_lock_while_training(tmp_path, monkeypatch):
+    import ultralytics
+    from fpyolo.train import LOCK_NAME, RunLocked, acquire_run_lock
+
+    seen = {}
+
+    class FakeYOLO:
+        def __init__(self, model):
+            pass
+
+        def train(self, **kw):
+            run = tmp_path / "run"
+            seen["lock_file"] = (run / LOCK_NAME).exists()
+            with pytest.raises(RunLocked):  # a second process would be refused now
+                acquire_run_lock(run)
+            seen["trained"] = True
+
+    monkeypatch.setattr(ultralytics, "YOLO", FakeYOLO)
+    cfg = CONFIGS / "train_d_yolo11n.yaml"
+    assert main(["--config", str(cfg), "--data", "d.yaml", "--seed", "0", "--project", str(tmp_path),
+                 "--name", "run", "--device", "cpu"]) == 0
+    assert seen == {"lock_file": True, "trained": True}

@@ -17,6 +17,39 @@ from fpyolo.schema import load_schema
 REPO = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = REPO / "configs" / "classes_v0.yaml"
 SMOKE = {"epochs": 1, "imgsz": 256, "fraction": 0.01, "batch": 4}
+LOCK_NAME = ".fpyolo.lock"
+_HELD_LOCKS: list = []  # open lock files, kept referenced so the flock lasts until the process exits
+
+
+class RunLocked(RuntimeError):
+    """Another process holds the run directory's lock (it is training that run)."""
+
+
+def acquire_run_lock(run_dir: Path):
+    """Take ``<run_dir>/.fpyolo.lock`` (``flock`` exclusive, non-blocking) for the life of the process.
+
+    ``fpyolo.train`` and ``fpyolo.runstate resume`` call this before touching a run, so a second
+    process can neither start nor resume a run that is still training. The kernel drops the lock
+    when the process dies, so a crashed run is never stuck as "locked". Raises ``RunLocked``.
+    """
+    import fcntl
+
+    f = open(Path(run_dir) / LOCK_NAME, "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        raise RunLocked(f"{run_dir} is locked: another process is training this run") from None
+    _HELD_LOCKS.append(f)
+    return f
+
+
+def release_run_lock(f) -> None:
+    """Release a lock from ``acquire_run_lock`` before the process ends (used by in-process tests)."""
+    _HELD_LOCKS.remove(f)
+    f.close()
+
+
 
 
 def train_kwargs(cfg: dict, seed: int, data: str, device: str, smoke: bool = False) -> dict:
@@ -145,6 +178,10 @@ def main(argv: list[str] | None = None) -> int:
     apply_device_env(args.device)
     record = env_record(args.device, args.data)
     run_dir.mkdir(parents=True)
+    try:
+        acquire_run_lock(run_dir)
+    except RunLocked as e:
+        ap.error(str(e))
     (run_dir / "env.json").write_text(json.dumps(record, indent=2) + "\n")
 
     from ultralytics import YOLO
