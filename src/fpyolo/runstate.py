@@ -50,7 +50,9 @@ first-epoch OOM handler halves only ``self.args.batch`` (line 589), so ``args.ya
 requested batch. The effective batch is in the checkpoints: ``save_model`` stores
 ``train_args = vars(self.args)`` (line 830) and ``strip_optimizer`` keeps it (torch_utils.py line 952).
 ``verify`` therefore reads ``train_args["batch"]`` from ``weights/last.pt`` (``best.pt`` as a fallback)
-and also fails if the run's log contains Ultralytics' "Reducing to batch" warning.
+and also fails if the last attempt in the run's log (after the last ``ATTEMPT_MARKER`` line) contains
+Ultralytics' "Reducing to batch" warning. The failure message deliberately does not repeat that phrase,
+because the sweep appends verify's output to the same log.
 """
 from __future__ import annotations
 
@@ -69,6 +71,10 @@ from fpyolo.train import LOCK_NAME, RunLocked, acquire_run_lock, apply_device_en
 
 STATES = ("absent", "running", "partial", "done", "broken")
 BATCH_WARNING = "Reducing to batch"  # Ultralytics' first-epoch OOM message (trainer.py lines 593-596)
+# Every attempt (start or resume) that scripts/run_all_seeds.sh appends to a run's log begins with a line
+# starting with this marker (keep in sync with the script; tests/test_run_all_seeds.py checks it).
+# verify only scans the log after the LAST such line: older attempts are history, not the current run.
+ATTEMPT_MARKER = "=== fpyolo-attempt"
 
 _FINISHED_MSG = (
     "training of {run_dir} reached its last epoch, but the final strip/validation did not run, so Ultralytics "
@@ -201,13 +207,26 @@ def _effective_batch(run_dir: Path):
     return None
 
 
+def _last_attempt_has_batch_warning(log: Path) -> bool:
+    """True if Ultralytics' batch-reduction warning appears after the last ``ATTEMPT_MARKER`` line
+    (the whole file if there is no marker, e.g. a run launched by hand)."""
+    hit = False
+    with open(log, errors="replace") as f:
+        for line in f:
+            if line.startswith(ATTEMPT_MARKER):
+                hit = False
+            elif BATCH_WARNING in line:
+                hit = True
+    return hit
+
+
 def verify_run(run_dir: str | Path, expected_batch: int, smi_csv: str | None,
                log_path: str | Path | None = None) -> list[str]:
     """Problems found in a run directory (empty list = fine).
 
     * ``args.yaml``: optimizer SGD.
     * Batch: the effective batch stored in the checkpoints (``train_args``) equals the requested one,
-      and ``log_path`` (if given) has no "Reducing to batch" line. ``args.yaml`` cannot show a
+      and the last attempt in ``log_path`` (if given) has no "Reducing to batch" line. ``args.yaml`` cannot show a
       first-epoch OOM halving, see the module docstring.
     * ``env.json`` / ``env_resume_*.json``: a GPU device; with ``smi_csv`` also that its PCI bus id
       matches the nvidia-smi row of that index.
@@ -228,9 +247,9 @@ def verify_run(run_dir: str | Path, expected_batch: int, smi_csv: str | None,
         problems.append(f"effective batch is {batch!r} (checkpoint train_args), requested {expected_batch}: "
                         "Ultralytics halved it after a first-epoch OOM")
     if log_path is not None and Path(log_path).is_file():
-        with open(log_path, errors="replace") as f:
-            if any(BATCH_WARNING in line for line in f):
-                problems.append(f"{Path(log_path).name} contains '{BATCH_WARNING}': the batch was reduced after an OOM")
+        if _last_attempt_has_batch_warning(Path(log_path)):
+            problems.append(f"{Path(log_path).name}: Ultralytics lowered the batch after a CUDA OOM in the last "
+                            "attempt (see the log)")
     records = [run_dir / "env.json", *sorted(run_dir.glob("env_resume_*.json"))]
     if not records[0].is_file():
         problems.append("env.json missing")

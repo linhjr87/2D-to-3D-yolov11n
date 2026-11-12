@@ -242,6 +242,46 @@ def test_resume_cli_requires_device(tmp_path):
     assert out.returncode == 2 and "--device" in out.stderr
 
 
+# ---- verify: only the last attempt in the log counts ----
+
+OOM_LINE = "WARNING CUDA out of memory with batch=32. Reducing to batch=16 and retrying (1/3).\n"
+
+
+def _attempt(*lines):
+    return f"{runstate.ATTEMPT_MARKER} 2026-11-12T00:00:00Z GPU 0: start x\n" + "".join(lines)
+
+
+def test_old_attempt_with_oom_warning_then_clean_new_attempt_passes(tmp_path):
+    run = _good_run(tmp_path)
+    log = tmp_path / "r.log"
+    log.write_text(_attempt("epoch 1\n", OOM_LINE) + _attempt("epoch 1\n", "epoch 2\n"))
+    assert verify_run(run, expected_batch=32, smi_csv=SMI, log_path=log) == []
+
+
+def test_warning_in_the_last_attempt_fails(tmp_path):
+    run = _good_run(tmp_path)
+    log = tmp_path / "r.log"
+    log.write_text(_attempt("epoch 1\n") + _attempt(OOM_LINE))
+    assert len(verify_run(run, expected_batch=32, smi_csv=SMI, log_path=log)) == 1
+
+
+def test_verify_output_appended_to_the_log_does_not_retrigger(tmp_path):
+    run = _good_run(tmp_path)
+    log = tmp_path / "r.log"
+    log.write_text(_attempt(OOM_LINE))
+    first = verify_run(run, expected_batch=32, smi_csv=SMI, log_path=log)
+    assert first
+    with open(log, "a") as f:  # what the sweep's `tee -a` does
+        f.writelines(f"PROBLEM r: {p}\n" for p in first)
+    log.write_text(log.read_text() + _attempt("clean\n"))  # then a clean rerun starts a new attempt
+    with open(log, "a") as f:
+        f.write("ok r\n")
+    assert verify_run(run, expected_batch=32, smi_csv=SMI, log_path=log) == []
+    # and without a new attempt the appended PROBLEM lines alone do not add a second problem
+    log.write_text(_attempt("clean\n") + "PROBLEM r: " + first[0] + "\n")
+    assert verify_run(run, expected_batch=32, smi_csv=SMI, log_path=log) == []
+
+
 # ---- verify ----
 
 def _good_run(tmp_path, *, batch=32, optimizer="SGD", device="1", bus="00000000:3B:00.0", args_batch=32):
@@ -292,7 +332,8 @@ def test_verify_log_with_reducing_to_batch(tmp_path):
     log = tmp_path / "r.log"
     log.write_text("epoch 1\nWARNING CUDA out of memory with batch=32. Reducing to batch=16 and retrying (1/3).\n")
     problems = verify_run(run, expected_batch=32, smi_csv=SMI, log_path=log)
-    assert len(problems) == 1 and "Reducing to batch" in problems[0]
+    assert len(problems) == 1 and "lowered the batch" in problems[0]
+    assert "Reducing to batch" not in problems[0]  # verify's own output must not re-trigger the grep
     log.write_text("epoch 1\n")
     assert verify_run(run, expected_batch=32, smi_csv=SMI, log_path=log) == []
     assert verify_run(run, expected_batch=32, smi_csv=SMI, log_path=tmp_path / "missing.log") == []
@@ -336,4 +377,4 @@ def test_verify_cli_expected_batch_from_config(tmp_path):
     log.write_text("Reducing to batch=16\n")
     logged = subprocess.run([sys.executable, "-m", "fpyolo.runstate", "verify", str(run), "--config", str(cfg),
                              "--log", str(log), "--no-nvidia-smi"], capture_output=True, text=True)
-    assert logged.returncode == 1 and "Reducing to batch" in logged.stdout
+    assert logged.returncode == 1 and "lowered the batch" in logged.stdout

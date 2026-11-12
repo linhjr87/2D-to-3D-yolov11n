@@ -110,9 +110,10 @@ GPUS="6 7" scripts/run_all_seeds.sh 2>&1 | tee -a runs/sweep.log
 - Optional variables: `BATCH_D`, `BATCH_W` (passed to `fpyolo.train --batch`; `BATCH_D` applies to both D models), `DATA_ROOT` (default `data/fpcad_v0`), `RUNS_DIR` (default `runs`), `PYTHON`.
 - `DRY_RUN=1 GPUS="6 7" scripts/run_all_seeds.sh` prints what each GPU slot would do (start, resume, skip) and runs nothing.
 - Run directories are `runs/<name>/` (for example `runs/d11n_s0/`) and logs are `runs/<name>.log` (appended on resume).
-- Finished runs are skipped (and verified again), interrupted runs are resumed, so after a crash, a reboot, or an out-of-memory error caused by another user's job you start the same command again **after the sweep has exited** and memory is free. A run directory with nothing to resume from (the run died before saving its first checkpoint) is reported as failed: delete that directory (`rm -rf runs/<name>`), then start the command again. A run that reached its last epoch but was killed before the final strip is also reported as failed by the resume step; it must not be deleted, see "Resume" below.
+- Finished runs are skipped (and verified again), interrupted runs are resumed, so after a crash, a reboot, or an out-of-memory error caused by another user's job you start the same command again **after the sweep has exited** and memory is free. A run directory with nothing to resume from (the run died before saving its first checkpoint) is reported as failed: delete that directory (`rm -rf runs/<name>`), then start the command again (the old `runs/<name>.log` is moved to `runs/<name>.log.<UTC stamp>.old` automatically when the run starts afresh). A run that reached its last epoch but was killed before the final strip is also reported as failed by the resume step; it must not be deleted, see "Resume" below.
+- Exit code of the script: 0 = all runs complete and verified, 1 = at least one run failed, 3 = none failed but at least one run was skipped because another process is training it. The failed and the skipped lists are always printed, so `scripts/run_all_seeds.sh && <evaluate>` only continues when everything is there.
 - Only one sweep can run per `runs/` directory (the script holds `runs/.sweep.lock`), and every run holds `runs/<name>/.fpyolo.lock` while it trains. A second sweep exits with an error; a run that another process is training is skipped with a warning, and `python -m fpyolo.runstate state` prints `running` for it. The locks are released by the kernel when a process dies, so a crashed run is simply `partial`.
-- After each run the script runs `python -m fpyolo.runstate verify` and prints `ok <name>` or `PROBLEM <name>: ...`. It checks `optimizer: SGD` in `args.yaml`, that the **effective batch** stored in `weights/last.pt` (`train_args`) equals the requested one and that the log has no "Reducing to batch" line (Ultralytics halves the batch after a first-epoch OOM; `args.yaml` is written once and keeps the requested value), and that `env.json` records a GPU whose PCI bus id matches `nvidia-smi`.
+- After each run the script runs `python -m fpyolo.runstate verify` and prints `ok <name>` or `PROBLEM <name>: ...`. It checks `optimizer: SGD` in `args.yaml`, that the **effective batch** stored in `weights/last.pt` (`train_args`) equals the requested one and that the last attempt in the log has no "Reducing to batch" line (every attempt starts with a `=== fpyolo-attempt` line; older attempts are ignored; Ultralytics halves the batch after a first-epoch OOM; `args.yaml` is written once and keeps the requested value), and that `env.json` records a GPU whose PCI bus id matches `nvidia-smi`.
 
 Check progress with `tail -f runs/<name>.log`, `nvidia-smi`, and `runs/<name>/results.csv` (one row per epoch).
 
@@ -125,14 +126,16 @@ The script already does these; repeat them by hand if in doubt:
 ```bash
 for r in runs/*_s[012]; do
     echo "== $r"; grep -E '^optimizer:' "$r/args.yaml"
-    python -c "import torch; print('effective batch', torch.load('$r/weights/last.pt', weights_only=False)['train_args']['batch'])"
-    grep -c 'Reducing to batch' "$r.log" || true                   # must print 0
+    python -c "import torch; print('effective batch', torch.load('$r/weights/last.pt', map_location='cpu', weights_only=False)['train_args']['batch'])"
+    # last attempt in the log has no batch reduction (a plain grep would also count old attempts);
+    # add --batch <n> if you started the sweep with BATCH_D / BATCH_W
+    python -m fpyolo.runstate verify "$r" --config "configs/$(case $r in *d11n*) echo train_d_yolo11n;; *d8n*) echo train_d_yolov8n;; *) echo train_w_yolo11n_seg;; esac).yaml" --log "$r.log" --no-nvidia-smi
     python -c "import json,sys; e=json.load(open('$r/env.json')); print(e['device'], e['gpu']['name'], e['gpu']['pci_bus_id'])"
 done
 nvidia-smi --query-gpu=index,pci.bus_id --format=csv          # bus ids must match
 ```
 
-Every `args.yaml` must show `optimizer: SGD`. All 6 D runs (both models) must show the same effective batch. An effective batch below the requested one (or a "Reducing to batch" line in the log) means Ultralytics halved it after an out-of-memory error; `args.yaml` still shows the requested value. Discard that run and rerun it with a smaller `BATCH_D` for all D runs.
+Every `args.yaml` must show `optimizer: SGD`. All 6 D runs (both models) must show the same effective batch. An effective batch below the requested one (or a "Reducing to batch" line in the log) means Ultralytics halved it after an out-of-memory error; `args.yaml` still shows the requested value. Discard that run and rerun it with a smaller `BATCH_D` for all D runs: `rm -rf runs/<name>`; its log is rotated to `runs/<name>.log.<UTC stamp>.old` when the new run starts (move it yourself if you start the run by hand with `fpyolo.train`). Old attempts in a log never make a clean rerun fail, only the last one counts.
 
 ## Resume
 

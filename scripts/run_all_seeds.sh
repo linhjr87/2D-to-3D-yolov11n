@@ -10,12 +10,16 @@
 #   done -> skipped (but still verified); running (another process holds the run's lock) -> skipped
 #   with a warning; broken (directory but nothing to resume from) -> reported as failed, see the
 #   README. The state logic lives in src/fpyolo/runstate.py.
+# * Exit code: 0 all runs complete and verified; 1 some run failed; 3 none failed but some run was
+#   skipped because another process is training it (the failed and skipped lists are always printed).
 # * Only one sweep per RUNS_DIR: the script holds flock on <RUNS_DIR>/.sweep.lock for its lifetime.
 #   Each run is also locked (<run>/.fpyolo.lock) by fpyolo.train / `runstate resume`.
 # * After each finished (or already done) run, `python -m fpyolo.runstate verify` checks the
 #   optimizer, the effective batch from the checkpoint plus the log (Ultralytics halves batch on a
 #   first-epoch OOM and args.yaml does not show it) and the GPU record in env.json.
-# * Logs: <RUNS_DIR>/<name>.log (appended on resume). Run directories: <RUNS_DIR>/<name>.
+# * Logs: <RUNS_DIR>/<name>.log, appended on resume; a fresh start first moves an existing log to
+#   <name>.log.<UTC stamp>.old. Every attempt begins with a "=== fpyolo-attempt" line and `verify`
+#   only scans the log after the last one. Run directories: <RUNS_DIR>/<name>.
 #
 # Environment (all optional except GPUS):
 #   BATCH_D, BATCH_W   override the config batch for D (both D configs, identical) / W
@@ -121,6 +125,7 @@ run_job() {  # run_job "<job row>" <gpu>  -> 0 ok/skipped, 1 failed
     if [ "$DRY_RUN" = 1 ]; then
         echo "[dry-run] GPU $gpu: $name state=$state -> $action"
         [ "${#cmd[@]}" -eq 0 ] || echo "    $(quote "${cmd[@]}")>> $(quote "$log")"
+        [ "$action" != start ] || [ ! -f "$log" ] || echo "    (existing log is rotated to $log.<UTC stamp>.old)"
         [ "$action" != skip ] || echo "    then: $(quote "$PYTHON" -m fpyolo.runstate verify "$run_dir" --config "$config" --log "$log" ${batch:+--batch "$batch"})"
         [ "$action" != FAIL ] || return 1
         return 0
@@ -143,7 +148,12 @@ run_job() {  # run_job "<job row>" <gpu>  -> 0 ok/skipped, 1 failed
 
     mkdir -p "$RUNS_DIR"
     echo "[GPU $gpu] $(stamp) $name: $action, log $log"
-    { echo "=== $(stamp) GPU $gpu: $(quote "${cmd[@]}")"; } >>"$log"
+    # rotate the log of a fresh start (e.g. after a discarded run); resumes keep appending
+    if [ "$action" = start ] && [ -f "$log" ]; then
+        mv "$log" "$log.$(date -u +%Y%m%dT%H%M%SZ).old"
+    fi
+    # the attempt header: fpyolo.runstate.ATTEMPT_MARKER, verify only reads the log after the last one
+    { echo "=== fpyolo-attempt $(stamp) GPU $gpu: $action $(quote "${cmd[@]}")"; } >>"$log"
     run_logged "$log" "${cmd[@]}" || rc=$?
     if [ "$rc" -ne 0 ]; then
         echo "[GPU $gpu] $(stamp) $name: FAILED (exit $rc), last log line: $(tail -n 1 "$log")" \
@@ -194,13 +204,19 @@ for pid in "${PIDS[@]}"; do
     while kill -0 "$pid" 2>/dev/null; do wait "$pid" || true; done
 done
 
+# exit 0 = all 9 runs complete and verified; 1 = some run failed; 3 = none failed but some run was skipped
+# because another process is training it (so `sweep && evaluate` never continues with runs missing)
+rc=0
 if [ -s "$CLAIMS/failed" ]; then
     echo "run_all_seeds: $(stamp) FAILED runs: $(tr '\n' ' ' < "$CLAIMS/failed")" >&2
-    exit 1
+    rc=1
 fi
 if [ -s "$CLAIMS/running" ]; then
     echo "run_all_seeds: $(stamp) WARNING: skipped runs that another process is training: $(tr '\n' ' ' < "$CLAIMS/running");" \
          "rerun this script when they have finished" >&2
-    exit 0
+    [ "$rc" -ne 0 ] || rc=3
 fi
-echo "run_all_seeds: $(stamp) all runs finished; next: evaluation (README)"
+if [ "$rc" -eq 0 ]; then
+    echo "run_all_seeds: $(stamp) all runs finished; next: evaluation (README)"
+fi
+exit "$rc"

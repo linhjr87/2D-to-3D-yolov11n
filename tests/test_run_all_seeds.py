@@ -149,10 +149,50 @@ def test_running_run_is_skipped_with_a_warning(tmp_path):
     run.mkdir(parents=True)
     (run / ".running").write_text("")
     out = _run(_env(tmp_path, GPUS="0"))
-    assert out.returncode == 0
+    assert out.returncode == 3  # nothing failed, but a run is missing: `sweep && evaluate` must stop
     assert "WARNING" in out.stderr and "w11n_s1" in out.stderr
     names = [e[1] for e in _events(tmp_path)]
     assert "w11n_s1" not in names and len([e for e in _events(tmp_path) if e[0] == "start"]) == 8
+
+
+def test_failed_and_running_lists_are_both_printed_and_failure_wins(tmp_path):
+    run = tmp_path / "runs" / "w11n_s1"
+    run.mkdir(parents=True)
+    (run / ".running").write_text("")
+    out = _run(_env(tmp_path, GPUS="0", STUB_FAIL="d8n_s1"))
+    assert out.returncode == 1
+    assert "FAILED runs: d8n_s1" in out.stderr and "another process is training: w11n_s1" in out.stderr
+
+
+def test_start_rotates_an_existing_log_and_writes_an_attempt_header(tmp_path):
+    from fpyolo.runstate import ATTEMPT_MARKER
+
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    (runs / "d11n_s0.log").write_text("old attempt: Reducing to batch=16\n")  # run dir was discarded, log remains
+    out = _run(_env(tmp_path, GPUS="0", STUB_SLEEP="0"))
+    assert out.returncode == 0, out.stderr
+    (old,) = runs.glob("d11n_s0.log.*.old")
+    assert old.read_text() == "old attempt: Reducing to batch=16\n"
+    log = (runs / "d11n_s0.log").read_text()
+    assert log.startswith(ATTEMPT_MARKER) and "Reducing to batch" not in log
+    assert log.count(ATTEMPT_MARKER) == 1
+
+
+def test_resume_appends_to_the_log_without_rotating(tmp_path):
+    runs = tmp_path / "runs"
+    (runs / "d8n_s0").mkdir(parents=True)
+    (runs / "d8n_s0" / ".partial").write_text("")
+    (runs / "d8n_s0.log").write_text("first attempt\n")
+    assert _run(_env(tmp_path, GPUS="0", STUB_SLEEP="0")).returncode == 0
+    assert not list(runs.glob("d8n_s0.log.*.old"))
+    assert (runs / "d8n_s0.log").read_text().startswith("first attempt\n=== fpyolo-attempt")
+
+
+def test_script_and_runstate_share_the_attempt_marker():
+    from fpyolo.runstate import ATTEMPT_MARKER
+
+    assert f'echo "{ATTEMPT_MARKER} ' in SCRIPT.read_text()
 
 
 HOLD_SWEEP_LOCK = """

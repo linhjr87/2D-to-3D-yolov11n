@@ -166,3 +166,43 @@ def test_train_main_holds_the_run_lock_while_training(tmp_path, monkeypatch):
     assert main(["--config", str(cfg), "--data", "d.yaml", "--seed", "0", "--project", str(tmp_path),
                  "--name", "run", "--device", "cpu"]) == 0
     assert seen == {"lock_file": True, "trained": True}
+
+
+PROBE = """
+import fcntl, sys, time
+f = open(sys.argv[1], "a")
+fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+print("locked", flush=True)
+time.sleep(float(sys.argv[2]))
+"""
+
+
+def _probe(path, seconds):
+    proc = subprocess.Popen([sys.executable, "-c", PROBE, str(path), str(seconds)], stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "locked"
+    return proc
+
+
+def test_acquire_run_lock_waits_out_a_short_state_probe(tmp_path):
+    from fpyolo.train import LOCK_NAME, acquire_run_lock, release_run_lock
+
+    proc = _probe(tmp_path / LOCK_NAME, 0.5)  # like `runstate state` holding the lock for a moment
+    try:
+        lock = acquire_run_lock(tmp_path)  # retries for ~2 s instead of failing at once
+        release_run_lock(lock)
+    finally:
+        proc.wait()
+
+
+def test_acquire_run_lock_gives_up_when_the_run_is_really_busy(tmp_path, monkeypatch):
+    from fpyolo import train as train_mod
+    from fpyolo.train import LOCK_NAME, RunLocked, acquire_run_lock
+
+    monkeypatch.setattr(train_mod, "LOCK_RETRIES", 3)
+    proc = _probe(tmp_path / LOCK_NAME, 30)
+    try:
+        with pytest.raises(RunLocked):
+            acquire_run_lock(tmp_path)
+    finally:
+        proc.kill()
+        proc.wait()

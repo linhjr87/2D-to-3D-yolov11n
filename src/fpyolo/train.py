@@ -18,6 +18,8 @@ REPO = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = REPO / "configs" / "classes_v0.yaml"
 SMOKE = {"epochs": 1, "imgsz": 256, "fraction": 0.01, "batch": 4}
 LOCK_NAME = ".fpyolo.lock"
+LOCK_RETRIES = 20  # x LOCK_RETRY_SLEEP = about 2 s of patience for a concurrent state probe
+LOCK_RETRY_SLEEP = 0.1
 _HELD_LOCKS: list = []  # open lock files, kept referenced so the flock lasts until the process exits
 
 
@@ -30,16 +32,23 @@ def acquire_run_lock(run_dir: Path):
 
     ``fpyolo.train`` and ``fpyolo.runstate resume`` call this before touching a run, so a second
     process can neither start nor resume a run that is still training. The kernel drops the lock
-    when the process dies, so a crashed run is never stuck as "locked". Raises ``RunLocked``.
+    when the process dies, so a crashed run is never stuck as "locked". Retries for about 2 s (a
+    concurrent ``runstate state`` probe holds the lock briefly), then raises ``RunLocked``.
     """
     import fcntl
+    import time
 
     f = open(Path(run_dir) / LOCK_NAME, "a")
-    try:
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        f.close()
-        raise RunLocked(f"{run_dir} is locked: another process is training this run") from None
+    for attempt in range(LOCK_RETRIES):
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            # `runstate state` probes the lock for a moment; wait it out before declaring the run busy
+            if attempt == LOCK_RETRIES - 1:
+                f.close()
+                raise RunLocked(f"{run_dir} is locked: another process is training this run") from None
+            time.sleep(LOCK_RETRY_SLEEP)
     _HELD_LOCKS.append(f)
     return f
 
