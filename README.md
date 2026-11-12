@@ -165,17 +165,20 @@ results/w11n_s0 ... w11n_s2   evaluate_w output: metrics.json (t_star, test_pixe
 results/compare.json          yolo11n vs yolov8n, seed-aware, cluster bootstrap
 ```
 
-**Memory.** Never pass image lists to Ultralytics predict (the code does not). Each evaluation process needs roughly 3 to 6 GB of host RAM. Run the **first evaluation alone**: the first `val` on the test split writes `data/fpcad_v0/D/labels/test.cache`, and several first runs started together would race on it. Cap it and measure it:
+**Memory.** Never pass image lists to Ultralytics predict (the code does not). Each evaluation process needs roughly 3 to 6 GB of host RAM. Run the **first D evaluation alone and the first W evaluation alone**: the first Ultralytics `val` on the test split writes a label cache, `data/fpcad_v0/D/labels/test.cache` for D and `data/fpcad_v0/W/labels/test.cache` for W, and several first runs of the same model started together would race on it. Cap them and measure them:
 
 ```bash
 GPU=6; D=data/fpcad_v0
 systemd-run --user --scope -p MemoryMax=12G -q \
     /usr/bin/time -v python -m fpyolo.evaluate_d --weights runs/d11n_s0/weights/best.pt \
         --dataset $D/D --split test --manifest $D/manifests --out results/d11n_s0 --device $GPU
-# read "Maximum resident set size" in the /usr/bin/time output; if systemd-run is unavailable run the line without it
+systemd-run --user --scope -p MemoryMax=12G -q \
+    /usr/bin/time -v python -m fpyolo.evaluate_w --weights runs/w11n_s0/weights/best.pt \
+        --dataset $D/W --out results/w11n_s0 --device $GPU
+# read "Maximum resident set size" in the /usr/bin/time output; if systemd-run is unavailable run the lines without it
 ```
 
-Then the rest, one after the other (to run several in parallel, use one GPU per process and make sure RAM is enough for `n` times the measured peak):
+Then the rest, one after the other (to run several in parallel, use one GPU per process and make sure RAM is enough for `n` times the measured peak; both caches exist by now):
 
 ```bash
 GPU=6; D=data/fpcad_v0
@@ -185,6 +188,7 @@ for s in 0 1 2; do
         python -m fpyolo.evaluate_d --weights runs/${m}_s$s/weights/best.pt \
             --dataset $D/D --split test --manifest $D/manifests --out results/${m}_s$s --device $GPU
     done
+    [ -f results/w11n_s$s/metrics.json ] && continue           # already done (the first one above)
     python -m fpyolo.evaluate_w --weights runs/w11n_s$s/weights/best.pt \
         --dataset $D/W --out results/w11n_s$s --device $GPU
 done
@@ -192,9 +196,64 @@ python -m fpyolo.compare --a results/d11n_s{0,1,2} --b results/d8n_s{0,1,2} \
     --manifest $D/manifests --out results/compare.json
 ```
 
+Both evaluations refuse weights whose class names are not the D (resp. W) classes of `--schema` (default `configs/classes_v0.yaml`), and `--limit` (smoke runs) is only accepted with `--device cpu`. `compare` requires all runs to record the same schema as its `--schema` and checks the dataset's class names against it.
+
 `evaluate_w` chooses the confidence threshold `t*` on the val split and reports the test split (`t_star` in `metrics.json`; `fpyolo.predict --w-conf` needs it).
 
 Final check: `ls results/*/metrics.json | wc -l` prints 9, `results/compare.json` exists, and the D and W folders contain `confusion_matrix*.png`.
+
+## Inference
+
+`python -m fpyolo.predict` runs D and W on new images and writes one JSON per image (spec §6.9, §7 item 5). Check every flag with `python -m fpyolo.predict --help`.
+
+**Which weights.** The deliverable is, for D and for W separately, the seed whose test headline is closest to the mean of the 3 seeds (D: `headline_map50_95`, W: `test_pixel_iou`, from `results/<run>/metrics.json`). This is a convention chosen here, **to be confirmed by the user**. It prints the two seeds:
+
+```bash
+python -c "
+import json, statistics
+for run, key in (('d11n', 'headline_map50_95'), ('w11n', 'test_pixel_iou')):
+    v = {s: json.load(open(f'results/{run}_s{s}/metrics.json'))[key] for s in (0, 1, 2)}
+    mean = statistics.mean(v.values())
+    print(run, 'seed', min(v, key=lambda s: abs(v[s] - mean)), v, 'mean', round(mean, 4))"
+```
+
+**Run.** With `KD` and `KW` the chosen D and W seeds (they may differ); `--w-conf` is the W threshold `t*` chosen on val by `evaluate_w`, read from that W run's `metrics.json`:
+
+```bash
+KD=0; KW=0                                           # from the command above
+W_CONF=$(python -c "import json; print(json.load(open('results/w11n_s$KW/metrics.json'))['t_star'])")
+python -m fpyolo.predict \
+    --d-weights runs/d11n_s$KD/weights/best.pt \
+    --w-weights runs/w11n_s$KW/weights/best.pt \
+    --w-conf "$W_CONF" \
+    --schema configs/classes_v0.yaml \
+    --input path/to/image_or_folder --out path/to/json_folder --device <cpu|idx>
+```
+
+- `--input` is one image or a folder of `.png`/`.jpg`/`.jpeg` images (not recursive). Each image gives `<out>/<image stem>.json`; two inputs with the same stem are refused.
+- Images must look like the training images: white background, thin black strokes of about 1 px, at the same mm/px scale (spec §6.10).
+- `--from-floorplancad-png`: the inputs are raw FloorPlanCAD RGBA tiles (for example `train-00/0000-0001.png`); they are converted to ink images the same way as in the dataset build. The output is named after the file stem only (`0000-0001.json`), without the archive prefix of the dataset ids (`train-00_0000-0001`), so use one `--out` folder per archive.
+- `--d-conf` is the D score threshold (default `0.25`); `--w-conf` is required, both in [0, 1].
+- Existing JSON files are refused (nothing is written) unless `--overwrite` is given.
+- Both weights are checked against `--schema`: their class names must be the D and the W classes of that schema, in order.
+- `--device` has no default: `cpu` or one GPU index (see "GPU selection").
+
+**JSON layout** (schematic; pixel coordinates of the input image, values rounded to 2 decimals):
+
+```text
+{
+  "image": "0000-0001.png", "width": 1000, "height": 1000, "schema_version": "v0",
+  "models": {"D": "best.pt@<sha256 prefix>", "W": "best.pt@<sha256 prefix>"},
+  "thresholds": {"D": 0.25, "W": 0.35},
+  "objects": [{"schema_id": 1, "name": "single_door", "score": 0.91, "bbox_xyxy": [x1, y1, x2, y2]}],
+  "walls": [{"schema_id": 31, "name": "wall", "score": 0.88,
+             "exterior": [[x, y], ...], "holes": [[[x, y], ...], ...]}]
+}
+```
+
+- Classes are given by `schema_id` (the stable id of `configs/classes_v0.yaml`) and name; YOLO class indices never appear in the JSON.
+- Each wall entry is one polygon: `exterior` is its outer ring and `holes` its inner rings, each a separate ring (no keyhole bridges). A predicted wall instance whose mask has several connected parts gives several entries with the same score.
+- `thresholds` records the D and W score thresholds used; `models` records each weights file name and the first 12 hex digits of its SHA-256.
 
 ## Bring the results back
 
@@ -224,7 +283,7 @@ python -m fpyolo.qa pred-overlays --d-weights runs/d11n_s0/weights/best.pt --w-w
     --out reports/qualitative --device <cpu|idx>
 ```
 
-`evaluate_w` also writes `wall_thickness_mm` (MAE, median |error|, bias in mm, from 2 * area / perimeter of the class-agnostic mask); the scale defaults to `overall_median` of `reports/scale.json`, override with `--mm-per-px`.
+`evaluate_w` also writes `wall_thickness_mm` (MAE, median |error|, bias in mm, from 2 * area / perimeter of the class-agnostic mask); the scale defaults to `overall_median` of `reports/scale.json`, override with `--mm-per-px`. Its origin is recorded as `scale_conclusion` (the `conclusion` of `scale.json`, or `user-supplied`) and printed by `fpyolo.report`. Walls cut by the tile border count as bar ends, which biases the thickness low for both label and prediction.
 
 ## License
 
