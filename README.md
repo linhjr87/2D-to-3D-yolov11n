@@ -208,6 +208,8 @@ Send it back with `scp`, or upload it to the same Hugging Face dataset repo unde
 
 ## Report
 
+The evaluation report is `reports/2026-11-12-floorplancad-yolo11n-report.md` (data issues, split, class table, scale, decisions; result sections are filled from the tables below once the runs are evaluated).
+
 Result tables (headline mean ± std, the YOLO11n vs YOLOv8n comparison, per-class and by-size AP, W metrics with the wall-thickness error in mm, data statistics), generated from `results/` and the build manifests; runs evaluated with `--limit` are refused and missing runs are listed as "missing":
 
 ```bash
