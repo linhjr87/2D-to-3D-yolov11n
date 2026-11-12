@@ -5,6 +5,8 @@ label overlays of a built dataset and side-by-side sheets of cross-space candida
     python -m fpyolo.qa bbox-raster --src <FloorPlanCAD> --n 500 --seed 0 --out reports/qa/bbox_raster.json
     python -m fpyolo.qa overlays --dataset <out>/D --n 50 --seed 0 --out reports/qa/overlays_D
     python -m fpyolo.qa pair-sheet --stats <out>/manifests/stats.json --src <FloorPlanCAD> --out reports/qa/cross_space
+    python -m fpyolo.qa pred-overlays --d-weights <pt> --w-weights <pt> --w-conf <t*> --dataset-root <out> \\
+        --split test --n 20 --seed 0 --out reports/qualitative --device <cpu|idx>
 
 Pixel convention: image coordinates are viewBox coordinates scaled to the
 true image size; pixel (i, j) is centered on integer coordinates (OpenCV
@@ -28,6 +30,7 @@ from PIL import Image
 
 from fpyolo.ink import load_ink
 from fpyolo.svgparse import Primitive, Tile, parse_tile
+from fpyolo.train import SCHEMA_PATH, apply_device_env
 
 ARCHIVES = ("train-00", "train-01", "test-00")
 THING_SIDS = tuple(range(3, 33))
@@ -416,6 +419,7 @@ def cmd_bbox_raster(args) -> int:
 
 _FILL_ALPHA = 0.45  # opacity of filled segmentation polygons
 _PAIR_CAPTION_H = 28
+_W_COLOR_BASE = 100  # W classes are coloured as classes 100+, so they differ from the D classes
 
 
 def _class_color(cls: int) -> tuple[int, int, int]:
@@ -430,9 +434,16 @@ def _save_palette_png(rgb: np.ndarray, path: Path) -> None:
     im.save(path, optimize=True)
 
 
-def overlay_labels(rgb: np.ndarray, label_text: str, names: dict[int, str]) -> np.ndarray:
+def _draw_box(out: np.ndarray, p0, p1, color, text: str) -> None:
+    """A 1-px rectangle captioned above its top-left corner (in place)."""
+    cv2.rectangle(out, p0, p1, color, 1)
+    cv2.putText(out, text, (p0[0], max(p0[1] - 3, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+
+
+def overlay_labels(rgb: np.ndarray, label_text: str, names: dict[int, str], color_base: int = 0) -> np.ndarray:
     """Draw YOLO label lines on an RGB image: `cls cx cy w h` lines as boxes captioned with the
-    class name, longer lines (`cls x1 y1 x2 y2 ...`) as translucent filled polygons with outlines."""
+    class name, longer lines (`cls x1 y1 x2 y2 ...`) as translucent filled polygons with outlines.
+    `color_base` shifts the class index used for the colour (so D and W classes drawn on one image differ)."""
     h, w = rgb.shape[:2]
     fill = rgb.copy()
     boxes, polys = [], []
@@ -441,7 +452,7 @@ def overlay_labels(rgb: np.ndarray, label_text: str, names: dict[int, str]) -> n
         if not vals:
             continue
         cls, xy = int(vals[0]), np.array(vals[1:], dtype=np.float64)
-        color = _class_color(cls)
+        color = _class_color(cls + color_base)
         if len(xy) == 4:
             cx, cy, bw, bh = xy * (w, h, w, h)
             p0 = (int(round(cx - bw / 2)), int(round(cy - bh / 2)))
@@ -455,8 +466,24 @@ def overlay_labels(rgb: np.ndarray, label_text: str, names: dict[int, str]) -> n
     for pts, color in polys:
         cv2.polylines(out, [pts], True, color, 1, cv2.LINE_8)
     for p0, p1, color, name in boxes:
-        cv2.rectangle(out, p0, p1, color, 1)
-        cv2.putText(out, name, (p0[0], max(p0[1] - 3, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+        _draw_box(out, p0, p1, color, name)
+    return out
+
+
+def overlay_predictions(rgb: np.ndarray, d_dets, w_dets, d_names: dict[int, str], w_names: dict[int, str],
+                        color_base: int = 0) -> np.ndarray:
+    """Draw predictions on an RGB image: `w_dets` (class, score, bool mask at native resolution) as
+    translucent filled masks, `d_dets` (class, score, (x1, y1, x2, y2)) as boxes captioned with the
+    class name and score."""
+    fill = rgb.copy()
+    any_mask = False
+    for cls, _, mask in w_dets:
+        fill[np.asarray(mask) > 0] = _class_color(cls + color_base)
+        any_mask = True
+    out = cv2.addWeighted(fill, _FILL_ALPHA, rgb, 1 - _FILL_ALPHA, 0) if any_mask else rgb.copy()
+    for cls, score, box in d_dets:
+        p0, p1 = (int(round(box[0])), int(round(box[1]))), (int(round(box[2])), int(round(box[3])))
+        _draw_box(out, p0, p1, _class_color(cls), f"{d_names.get(cls, cls)} {score:.2f}")
     return out
 
 
@@ -500,10 +527,75 @@ def cmd_pair_sheet(args) -> int:
 
 
 
+def _caption(rgb: np.ndarray, text: str) -> np.ndarray:
+    """`rgb` under a white caption strip."""
+    strip = np.full((_PAIR_CAPTION_H, rgb.shape[1], 3), 255, dtype=np.uint8)
+    cv2.putText(strip, text, (6, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    return np.vstack([strip, rgb])
+
+
+def cmd_pred_overlays(args) -> int:
+    """For n seeded random images present in both D and W: left GT (D boxes + W polygons from the
+    labels), right predictions (D boxes with score >= d_conf + W masks >= t*). One predict call per image."""
+    from fpyolo.evaluate_d import label_path, read_label_rows, split_images
+    from fpyolo.predict import (
+        IMGSZ, IOU, MAX_DET, _predict_one, check_model_names, extract_d, extract_w,
+    )
+    from fpyolo.schema import load_schema
+
+    apply_device_env(args.device)  # before anything can touch CUDA
+    root, out = Path(args.dataset_root), Path(args.out)
+    schema = load_schema(Path(args.schema))
+    d_names, w_names = schema.yolo_names("D"), schema.yolo_names("W")
+    d_imgs = {p.stem: p for p in split_images(root / "D", args.split)}
+    w_imgs = {p.stem: p for p in split_images(root / "W", args.split)}
+    common = sorted(set(d_imgs) & set(w_imgs))
+    if not common:
+        raise ValueError(f"no {args.split} image is present in both {root / 'D'} and {root / 'W'}")
+    pick = sorted(np.random.default_rng(args.seed).choice(len(common), size=min(args.n, len(common)), replace=False))
+
+    from ultralytics import YOLO
+
+    d_model, w_model = YOLO(str(args.d_weights)), YOLO(str(args.w_weights))
+    check_model_names(d_model, schema, "D", Path(args.d_weights))
+    check_model_names(w_model, schema, "W", Path(args.w_weights))
+    kw = dict(imgsz=IMGSZ, iou=IOU, max_det=MAX_DET, device=args.device)
+    out.mkdir(parents=True, exist_ok=True)
+    for i in pick:
+        stem = common[i]
+        d_path, w_path = d_imgs[stem], w_imgs[stem]
+        with Image.open(d_path) as im:
+            rgb = np.asarray(im.convert("RGB"))
+        h, w = rgb.shape[:2]
+        d_text = "\n".join(" ".join(r) for r in read_label_rows(label_path(d_path)))
+        w_text = "\n".join(" ".join(r) for r in read_label_rows(label_path(w_path)))
+        gt = overlay_labels(overlay_labels(rgb, w_text, w_names, color_base=_W_COLOR_BASE), d_text, d_names)
+
+        rd = _predict_one(d_model, d_path, None, conf=args.d_conf, **kw)
+        if tuple(rd.orig_shape) != (h, w):
+            raise RuntimeError(f"{d_path}: predicted on {tuple(rd.orig_shape)}, the image is {(h, w)}")
+        d_dets = extract_d(rd)
+        del rd
+        rw = _predict_one(w_model, w_path, None, conf=args.w_conf, retina_masks=True, **kw)
+        if tuple(rw.orig_shape) != (h, w):
+            raise RuntimeError(f"D and W disagree on the size of {stem}: {(h, w)} vs {tuple(rw.orig_shape)}")
+        w_dets = list(extract_w(rw, h, w))
+        del rw
+        pred = overlay_predictions(rgb, d_dets, w_dets, d_names, w_names, color_base=_W_COLOR_BASE)
+
+        sep = np.full((h, _GAP, 3), 160, dtype=np.uint8)
+        left = _caption(gt, f"{args.split}/{stem}  GT: D boxes + W polygons")
+        right = _caption(pred, f"predictions: D score >= {args.d_conf:g}, W masks >= t* {args.w_conf:g}")
+        sheet = np.hstack([left, np.vstack([np.full((_PAIR_CAPTION_H, _GAP, 3), 160, np.uint8), sep]), right])
+        _save_palette_png(sheet, out / f"{args.split}_{stem}.png")
+    print(f"{len(pick)} prediction overlays of {len(common)} images -> {out}")
+    return 0
+
+
 # --------------------------------------------------------------------- CLI ---
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="python -m fpyolo.qa", description="Real-data QA tools.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -540,7 +632,24 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("--size", type=int, default=640, help="side of each tile in the sheet, px")
     ps.set_defaults(func=cmd_pair_sheet)
 
-    args = ap.parse_args(argv)
+    po = sub.add_parser("pred-overlays", help="ground truth (left) vs. D + W predictions (right) of n test images")
+    po.add_argument("--d-weights", type=Path, required=True)
+    po.add_argument("--w-weights", type=Path, required=True)
+    po.add_argument("--w-conf", type=float, required=True, help="wall threshold t* chosen on val")
+    po.add_argument("--d-conf", type=float, default=0.25, help="object score threshold")
+    po.add_argument("--dataset-root", type=Path, required=True, help="build output holding D/ and W/")
+    po.add_argument("--split", default="test", choices=["train", "val", "test"])
+    po.add_argument("--n", type=int, default=20)
+    po.add_argument("--seed", type=int, default=0)
+    po.add_argument("--out", type=Path, required=True)
+    po.add_argument("--device", required=True, help="'cpu' or one GPU index; there is no default")
+    po.add_argument("--schema", type=Path, default=SCHEMA_PATH)
+    po.set_defaults(func=cmd_pred_overlays)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     return args.func(args)
 
 

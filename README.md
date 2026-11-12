@@ -206,6 +206,24 @@ The archive holds `results/` (all metrics, `compare.json`, confusion matrices, `
 
 Send it back with `scp`, or upload it to the same Hugging Face dataset repo under `results/` (`hf upload linhjr87/2D-to-3D-yolov11n results_<sha>_<date>.tar.gz results/results_<sha>_<date>.tar.gz --repo-type dataset`). Also push any README change (the batch table) to the GitHub branch.
 
+## Report
+
+Result tables (headline mean ± std, the YOLO11n vs YOLOv8n comparison, per-class and by-size AP, W metrics with the wall-thickness error in mm, data statistics), generated from `results/` and the build manifests; runs evaluated with `--limit` are refused and missing runs are listed as "missing":
+
+```bash
+python -m fpyolo.report --results results --manifests data/fpcad_v0/manifests --out reports/tables.md
+```
+
+Qualitative examples: ground truth (left) against D boxes with score >= 0.25 and W masks >= `t*` (right) for 20 seeded random test images present in both datasets. CPU or one free GPU, never a default:
+
+```bash
+python -m fpyolo.qa pred-overlays --d-weights runs/d11n_s0/weights/best.pt --w-weights runs/w11n_s0/weights/best.pt \
+    --w-conf <t* from results/w11n_s0/metrics.json> --dataset-root data/fpcad_v0 --split test --n 20 --seed 0 \
+    --out reports/qualitative --device <cpu|idx>
+```
+
+`evaluate_w` also writes `wall_thickness_mm` (MAE, median |error|, bias in mm, from 2 * area / perimeter of the class-agnostic mask); the scale defaults to `overall_median` of `reports/scale.json`, override with `--mm-per-px`.
+
 ## License
 
 - FloorPlanCAD labels: CC BY-NC 4.0.
