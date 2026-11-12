@@ -146,6 +146,21 @@ def collect_inputs(inp: Path) -> list[Path]:
     return files
 
 
+def check_model_names(model, schema: Schema, key: str, weights: Path) -> None:
+    """Fail unless the model's class names are exactly the schema's classes of `key`, in order."""
+    got = {int(k): v for k, v in model.names.items()}
+    want = schema.yolo_names(key)
+    if got == want:
+        return
+    if len(got) != len(want):
+        detail = f"{len(got)} classes, the schema has {len(want)}"
+    else:
+        i = next(i for i in sorted(want) if got.get(i) != want[i])
+        detail = f"class {i} is {got.get(i)!r}, the schema has {want[i]!r}"
+    raise ValueError(f"{weights}: class names differ from the {key} classes of schema "
+                     f"{schema.version} ({detail})")
+
+
 def model_id(weights: Path) -> str:
     return f"{Path(weights).name}@{_sha256(Path(weights))[:12]}"
 
@@ -164,6 +179,8 @@ def run(d_weights: Path, w_weights: Path, w_conf: float, schema_path: Path, inp:
     from ultralytics import YOLO
 
     d_model, w_model = YOLO(str(d_weights)), YOLO(str(w_weights))
+    check_model_names(d_model, schema, "D", d_weights)
+    check_model_names(w_model, schema, "W", w_weights)
     model_ids = {"D": model_id(d_weights), "W": model_id(w_weights)}
     out.mkdir(parents=True, exist_ok=True)
     for path, target in zip(files, targets):

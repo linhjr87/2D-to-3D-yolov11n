@@ -32,6 +32,20 @@ def test_mask_ring_gives_one_hole():
     assert all(abs(p[0] - 30) < 12 and abs(p[1] - 30) < 12 for p in holes[0])
 
 
+def test_two_exteriors_each_with_own_hole():
+    m = np.zeros((60, 140), np.uint8)
+    cv2.circle(m, (30, 30), 25, 1, -1)
+    cv2.circle(m, (30, 30), 10, 0, -1)
+    cv2.circle(m, (100, 30), 25, 1, -1)
+    cv2.circle(m, (100, 30), 10, 0, -1)
+    polys = mask_to_polygons(m)
+    assert len(polys) == 2
+    for (ext, holes), cx in zip(sorted(polys, key=lambda p: min(x for x, _ in p[0])), (30, 100)):
+        assert len(holes) == 1
+        assert min(x for x, _ in ext) < cx - 20 and max(x for x, _ in ext) > cx + 20
+        assert all(abs(x - cx) < 12 for x, _ in holes[0])     # the hole belongs to this exterior
+
+
 def test_mask_components_and_empty():
     m = np.zeros((40, 40), np.uint8)
     m[2:10, 2:10] = 1
@@ -150,6 +164,69 @@ def test_refuses_overwrite_before_loading_models(tmp_path):
     with pytest.raises(FileExistsError, match="--overwrite"):
         predict.run(Path("d.pt"), Path("w.pt"), 0.3, CONFIGS / "classes_v0.yaml", img, out, "cpu")
     assert (out / "a.json").read_text() == "{}"
+
+
+def _named(names, **kw):
+    m = FakeModel(60, 60, **kw)
+    m.names = names
+    return m
+
+
+def _schema_names(key):
+    return SCHEMA.yolo_names(key)
+
+
+def test_check_model_names_accepts_schema_names():
+    for key in ("D", "W"):
+        predict.check_model_names(_named(_schema_names(key)), SCHEMA, key, Path("x.pt"))
+
+
+@pytest.mark.parametrize("variant", ["fewer", "more", "swapped", "renamed"])
+def test_check_model_names_rejects_mismatch(variant):
+    names = dict(_schema_names("W"))
+    if variant == "fewer":
+        del names[2]
+    elif variant == "more":
+        names[3] = "extra"
+    elif variant == "swapped":
+        names[0], names[1] = names[1], names[0]
+    else:
+        names[0] = "wall2"
+    with pytest.raises(ValueError, match=r"x\.pt.*differ from the W classes"):
+        predict.check_model_names(_named(names), SCHEMA, "W", Path("x.pt"))
+    # a D model passed as W is rejected too
+    with pytest.raises(ValueError):
+        predict.check_model_names(_named(_schema_names("D")), SCHEMA, "W", Path("x.pt"))
+
+
+def test_run_rejects_mismatched_weights_before_predicting(tmp_path, monkeypatch):
+    import ultralytics
+
+    bad = _named({0: "wall"})
+    monkeypatch.setattr(ultralytics, "YOLO", lambda p: bad)
+    img = tmp_path / "a.png"
+    img.write_bytes(b"")
+    with pytest.raises(ValueError, match="differ from the D classes"):
+        predict.run(Path("d.pt"), Path("w.pt"), 0.3, CONFIGS / "classes_v0.yaml", img, tmp_path / "o", "cpu")
+    assert bad.calls == [] and not (tmp_path / "o").exists()
+
+
+def test_odd_size_999_image():
+    h, w = 999, 999
+    mask = np.zeros((h, w), np.uint8)
+    mask[100:300, 50:998] = 1
+    d = FakeModel(h, w, boxes=[(0, 0.9, (0.0, 0.0, 998.0, 998.0))])
+    wm = FakeModel(h, w, boxes=[(0, 0.8, (0.0, 0.0, 1.0, 1.0))], masks=mask[None])
+    d_out, w_out = predict.extract_d(d.predict("x")[0]), list(predict.extract_w(wm.predict("x")[0], h, w))
+    doc = to_json("x.png", w, h, d_out, w_out, SCHEMA, IDS)
+    assert (doc["width"], doc["height"]) == (999, 999)
+    pts = doc["walls"][0]["exterior"]
+    assert all(0 <= x <= w - 1 and 0 <= y <= h - 1 for x, y in pts)
+    assert max(x for x, _ in pts) == 997.0 and max(y for _, y in pts) == 299.0
+    assert all(0 <= v <= 999 for v in doc["objects"][0]["bbox_xyxy"])
+    bad = FakeModel(h, w, boxes=[(0, 0.8, (0.0, 0.0, 1.0, 1.0))], masks=np.zeros((1, 1000, 1000)))
+    with pytest.raises(ValueError, match="retina_masks"):
+        list(predict.extract_w(bad.predict("x")[0], h, w))
 
 
 SMOKE_D, SMOKE_W = REPO / "runs/smoke/d/weights/last.pt", REPO / "runs/smoke/w/weights/last.pt"
