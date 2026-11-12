@@ -130,3 +130,15 @@ def test_gpu_device_leaves_visibility_alone(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     apply_device_env("1")
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1"
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "-16"])
+def test_batch_below_one_rejected(bad, capsys, tmp_path):
+    # Ultralytics treats batch < 1 as auto-batch, which would break identical D batches.
+    cfg = CONFIGS / "train_d_yolo11n.yaml"
+    with pytest.raises(SystemExit) as e:
+        main(["--config", str(cfg), "--data", "d.yaml", "--seed", "0", "--project", str(tmp_path),
+              "--name", "run", "--device", "cpu", "--batch", bad])
+    assert e.value.code == 2
+    assert "--batch" in capsys.readouterr().err
+    assert not (tmp_path / "run").exists()

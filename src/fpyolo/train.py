@@ -106,6 +106,20 @@ def env_record(device: str, data_yaml: Path | None = None) -> dict:
     }
 
 
+def _positive_int(text: str) -> int:
+    """argparse type: Ultralytics treats batch < 1 as auto-batch, so reject it."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be >= 1 (got {value}); Ultralytics would turn batch < 1 into auto-batch, "
+            "which breaks identical D batches"
+        )
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m fpyolo.train", description=__doc__.split("\n")[0])
     ap.add_argument("--config", required=True, type=Path)
@@ -114,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--project", required=True, type=Path)
     ap.add_argument("--name", required=True)
     ap.add_argument("--device", required=True, help="'cpu' or one GPU index; there is no default")
-    ap.add_argument("--batch", type=int, help="override the config batch (e.g. after an OOM trial)")
+    ap.add_argument("--batch", type=_positive_int, help="override the config batch (e.g. after an OOM trial)")
     ap.add_argument("--smoke", action="store_true", help="epochs=1 imgsz=256 fraction=0.01 batch=4")
     args = ap.parse_args(argv)
 
