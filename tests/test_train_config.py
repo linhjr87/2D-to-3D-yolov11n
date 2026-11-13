@@ -59,8 +59,9 @@ def test_env_record_keys():
     rec = env_record("cpu")
     assert set(rec) == {
         "ultralytics", "torch", "cuda", "gpu", "device",
-        "git_commit", "schema_version", "split_manifest_sha256",
+        "git_commit", "git_dirty", "schema_version", "split_manifest_sha256",
     }
+    assert rec["git_dirty"] in (True, False, None)
     assert rec["device"] == "cpu" and rec["gpu"] is None
     assert rec["schema_version"] == "v0"
     assert rec["split_manifest_sha256"] is None
@@ -206,3 +207,19 @@ def test_acquire_run_lock_gives_up_when_the_run_is_really_busy(tmp_path, monkeyp
     finally:
         proc.kill()
         proc.wait()
+
+
+def test_git_dirty_reflects_tracked_changes(tmp_path, monkeypatch):
+    import subprocess
+    import fpyolo.train as tr
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "f.txt").write_text("a\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "f.txt"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-qm", "init"], check=True)
+    monkeypatch.setattr(tr, "REPO", tmp_path)
+    assert tr._git_dirty() is False
+    (tmp_path / "untracked.txt").write_text("x")
+    assert tr._git_dirty() is False
+    (tmp_path / "f.txt").write_text("b\n")
+    assert tr._git_dirty() is True

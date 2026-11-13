@@ -89,6 +89,18 @@ def _git_commit() -> str | None:
     return out.stdout.strip() or None
 
 
+def _git_dirty() -> bool | None:
+    """True if tracked files differ from HEAD (the run then used code that no commit records)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(REPO), "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True, check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return bool(out.stdout.strip())
+
+
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -143,6 +155,7 @@ def env_record(device: str, data_yaml: Path | None = None) -> dict:
         "gpu": None if device == "cpu" else _gpu_info(device),
         "device": device,
         "git_commit": _git_commit(),
+        "git_dirty": _git_dirty(),
         "schema_version": load_schema(SCHEMA_PATH).version,
         "split_manifest_sha256": manifest,
     }
